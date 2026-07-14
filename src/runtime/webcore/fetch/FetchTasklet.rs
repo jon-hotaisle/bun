@@ -407,14 +407,17 @@ impl FetchTasklet {
         let enqueued = Self::enqueue_concurrent(&vm, || {
             ConcurrentTask::from_callback(this, FetchTasklet::deinit_callback)
         });
-        if enqueued != Some(true) {
-            // VM shutting down or (worker) already destroyed.
-            // SAFETY: last ref; exclusive access. `deinit()` would run
-            // `clear_data()` + `Drop` for the JSC `Strong`/`Weak` fields, which
-            // reach into the VM's HandleSet from this (HTTP) thread — not
-            // thread-safe. Reclaim only the Rust-side boxes; the HandleSet is
-            // freed wholesale by `destructOnExit`.
-            unsafe { FetchTasklet::dealloc_for_shutdown(this) };
+        match enqueued {
+            Some(true) => {}
+            // Main VM exiting: park the box for `shutdown_for_exit`'s drain,
+            // which runs full `deinit()` on the JS thread (its HandleSet is
+            // still alive — the daemon parks before the main VM is destroyed).
+            // SAFETY: last ref (release() returned true); exclusive access.
+            Some(false) => unsafe { FetchTasklet::dealloc_for_shutdown(this) },
+            // Worker VM destroyed (gate closed): its HandleSet is already
+            // freed, so parking would UAF at the exit drain — leak the box
+            // per the `VMHandle::enqueue_task_concurrent` policy.
+            None => {}
         }
     }
 

@@ -47,8 +47,9 @@ impl ShutdownGate {
     pub fn leave(&self) {
         let prev = self.state.fetch_sub(GUEST, Ordering::Release);
         if prev == CLOSED | GUEST {
-            // Last guest out of a closed gate: wake `close_and_wait`.
-            futex::wake(&self.state, 1);
+            // Last guest out of a closed gate: wake `close_and_wait` (all
+            // waiters — `close_and_wait` is callable from several owners).
+            futex::wake(&self.state, u32::MAX);
         }
     }
 
@@ -60,6 +61,49 @@ impl ShutdownGate {
         while state != CLOSED {
             let _ = futex::wait(&self.state, state, None);
             state = self.state.load(Ordering::Acquire);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn close_and_wait_drains_racing_guests() {
+        for _ in 0..64 {
+            let gate = Arc::new(ShutdownGate::new());
+            let inside = Arc::new(AtomicUsize::new(0));
+            let rejected = Arc::new(AtomicUsize::new(0));
+            let guests: Vec<_> = (0..8)
+                .map(|_| {
+                    let (gate, inside, rejected) =
+                        (gate.clone(), inside.clone(), rejected.clone());
+                    std::thread::spawn(move || {
+                        for _ in 0..500 {
+                            if gate.enter() {
+                                inside.fetch_add(1, Ordering::SeqCst);
+                                std::hint::spin_loop();
+                                inside.fetch_sub(1, Ordering::SeqCst);
+                                gate.leave();
+                            } else {
+                                rejected.fetch_add(1, Ordering::SeqCst);
+                                return;
+                            }
+                        }
+                    })
+                })
+                .collect();
+            gate.close_and_wait();
+            // After close_and_wait returns, no guest is inside and none can enter.
+            assert_eq!(inside.load(Ordering::SeqCst), 0);
+            assert!(!gate.enter());
+            gate.close_and_wait(); // idempotent
+            for g in guests {
+                g.join().unwrap();
+            }
         }
     }
 }

@@ -687,7 +687,6 @@ impl JSPasswordObject {
             op,
             password,
             promise,
-            // SAFETY: bun_vm() is non-null for a Bun-owned global; VM outlives the job.
             vm: global_object.bun_vm().cross_thread_handle(),
             global: std::ptr::from_ref(global_object),
             r#ref: KeepAlive::default(),

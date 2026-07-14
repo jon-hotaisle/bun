@@ -2178,6 +2178,8 @@ mod _async_tasks {
         /// Wrapped in [`ThreadSafe`] so the paired `unprotect()` runs on drop.
         pub args: ThreadSafe<args::Readdir>,
         pub global_object: bun_ptr::BackRef<JSGlobalObject>,
+        /// Cross-thread handle to the owning VM; see [`VMHandle`].
+        pub vm: bun_jsc::vm_handle::VMHandle,
         pub task: WorkPoolTask,
         pub r#ref: KeepAlive,
         pub tracker: AsyncTaskTracker,
@@ -2373,6 +2375,7 @@ mod _async_tasks {
                 args: FsArgument::into_thread_safe(args),
                 has_result: AtomicBool::new(false),
                 global_object: bun_ptr::BackRef::new(global_object),
+                vm: vm.cross_thread_handle(),
                 task: work_pool_task(Self::work_pool_callback),
                 r#ref: KeepAlive::default(),
                 tracker: AsyncTaskTracker::init(vm),
@@ -2548,16 +2551,11 @@ mod _async_tasks {
                 }
             }
 
-            // `bun_vm_concurrently()` skips the JS-thread debug assert and is the
-            // documented accessor for off-thread (work-pool) callers.
-            // SAFETY: `bun_vm_concurrently()` returns the process-singleton VM;
-            // sole `&mut` borrow at this point on the work-pool thread.
-            let vm = unsafe { &mut *self.global_object().bun_vm_concurrently() };
-            // `ConcurrentTask::create` heap-allocates a fresh task; the
-            // queue takes ownership of it.
-            vm.enqueue_task_concurrent(ConcurrentTask::create(Task::init(std::ptr::from_mut::<
-                Self,
-            >(self))));
+            // On `false` (worker VM destroyed) the task is leaked per the
+            // `VMHandle::enqueue_task_concurrent` policy.
+            let vm = self.vm.clone();
+            let this_ptr = std::ptr::from_mut::<Self>(self);
+            let _ = vm.enqueue_task_concurrent(|| ConcurrentTask::create(Task::init(this_ptr)));
         }
 
         fn clear_result_list(&mut self) {

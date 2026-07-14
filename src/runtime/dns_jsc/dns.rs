@@ -2124,6 +2124,9 @@ impl DNSLookup {
                     &mut (*this).promise,
                 )
                 .reject_later(global_this);
+                if let Some(resolver) = (*this).resolver.as_ref() {
+                    (*resolver.as_ptr()).request_completed();
+                }
                 Self::destroy(this);
                 return;
             }
