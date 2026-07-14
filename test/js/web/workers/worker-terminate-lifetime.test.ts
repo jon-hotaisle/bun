@@ -142,48 +142,54 @@ test(
 
 // Same bug class as the fetch test above, for work-pool producers: async fs,
 // Bun.password, zlib, and DNS completions on pool threads enqueued into the
-// worker VM's concurrent-task queue after terminate() freed it.
-test(
-  "terminating a worker with work-pool jobs in flight does not UAF the worker VM",
-  async () => {
-    await using proc = Bun.spawn({
-      cmd: [
-        bunExe(),
-        "-e",
-        `
-        const workerSource =
-          "const swallow = () => {};" +
-          "for (let i = 0; i < 8; i++) {" +
-          "  Bun.password.hash('hunter2', { algorithm: 'bcrypt', cost: 8 }).then(swallow, swallow);" +
-          "  require('node:zlib').gzip(Buffer.alloc(1 << 16, 7), swallow);" +
-          "  require('node:fs/promises').stat(process.execPath).then(swallow, swallow);" +
-          "  require('node:dns').promises.lookup('localhost').then(swallow, swallow);" +
-          "}" +
-          "postMessage('working');";
-        const url = "data:text/javascript," + encodeURIComponent(workerSource);
-        for (let i = 0; i < ${perRound}; i++) {
-          const w = new Worker(url);
-          await new Promise(resolve => (w.onmessage = resolve));
-          await Bun.sleep(i % 4);
-          w.terminate();
-        }
-        console.log("done");
-        process.exit(0);
-      `,
-      ],
-      env: bunEnv,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+// worker VM's concurrent-task queue after terminate() freed it. One test per
+// producer, run sequentially: combining job types multiplies pool load and
+// trips a separate, pre-existing JSC worker-churn crash unrelated to this
+// bug class.
+const workPoolJobs: [name: string, source: string][] = [
+  ["Bun.password", "Bun.password.hash('hunter2', { algorithm: 'bcrypt', cost: 8 }).then(swallow, swallow);"],
+  ["node:zlib", "require('node:zlib').gzip(Buffer.alloc(1 << 16, 7), swallow);"],
+  ["node:fs", "require('node:fs/promises').stat(process.execPath).then(swallow, swallow);"],
+  ["node:dns", "require('node:dns').promises.lookup('localhost').then(swallow, swallow);"],
+];
+for (const [name, job] of workPoolJobs) {
+  test(
+    `terminating a worker with ${name} jobs in flight does not UAF the worker VM`,
+    async () => {
+      await using proc = Bun.spawn({
+        cmd: [
+          bunExe(),
+          "-e",
+          `
+          const workerSource =
+            "const swallow = () => {};" +
+            "for (let i = 0; i < 8; i++) { " + ${JSON.stringify(job)} + " }" +
+            "postMessage('working');";
+          const url = "data:text/javascript," + encodeURIComponent(workerSource);
+          for (let i = 0; i < ${perRound}; i++) {
+            const w = new Worker(url);
+            await new Promise(resolve => (w.onmessage = resolve));
+            await Bun.sleep(i % 4);
+            w.terminate();
+          }
+          console.log("done");
+          process.exit(0);
+        `,
+        ],
+        env: bunEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
 
-    // stderr is drained but not asserted: ASAN/debug builds emit benign noise.
-    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
-    if (exitCode !== 0) console.error("child stderr:\n" + stderr);
-    expect(stdout).toBe("done\n");
-    expect(exitCode).toBe(0);
-  },
-  timeout,
-);
+      // stderr is drained but not asserted: ASAN/debug builds emit benign noise.
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      if (exitCode !== 0) console.error("child stderr:\n" + stderr);
+      expect(stdout).toBe("done\n");
+      expect(exitCode).toBe(0);
+    },
+    timeout,
+  );
+}
 
 // Regression: WebWorker__dispatchExit deref'd the C++ Worker on the worker
 // thread; if that was the last ref, ~Worker → ~EventTarget ran there and
