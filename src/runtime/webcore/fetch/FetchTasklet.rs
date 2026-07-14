@@ -407,17 +407,11 @@ impl FetchTasklet {
         let enqueued = Self::enqueue_concurrent(&vm, || {
             ConcurrentTask::from_callback(this, FetchTasklet::deinit_callback)
         });
-        match enqueued {
-            Some(true) => {}
-            // Main VM exiting: park the box for `shutdown_for_exit`'s drain,
-            // which runs full `deinit()` on the JS thread (its HandleSet is
-            // still alive — the daemon parks before the main VM is destroyed).
+        if enqueued != Some(true) {
+            // `dealloc_for_shutdown` parks main-VM boxes for the exit drain
+            // and leaks destroyed-worker boxes.
             // SAFETY: last ref (release() returned true); exclusive access.
-            Some(false) => unsafe { FetchTasklet::dealloc_for_shutdown(this) },
-            // Worker VM destroyed (gate closed): its HandleSet is already
-            // freed, so parking would UAF at the exit drain — leak the box
-            // per the `VMHandle::enqueue_task_concurrent` policy.
-            None => {}
+            unsafe { FetchTasklet::dealloc_for_shutdown(this) };
         }
     }
 
@@ -536,6 +530,14 @@ impl FetchTasklet {
         bun_output::scoped_log!(FetchTasklet, "deallocForShutdown");
         // SAFETY: caller contract — `this` is live with ref_count == 0.
         unsafe { (*this).ref_count.assert_no_refs() };
+        // Destroyed worker VM (gate closed): the drain's `deinit()` would drop
+        // JSC handles into the worker's freed HandleSet — leak the box instead
+        // per the `VMHandle::enqueue_task_concurrent` policy. The main VM's
+        // gate is open here (its teardown postdates the HTTP daemon park).
+        // SAFETY: `this` is live per the caller contract.
+        if unsafe { &(*this).javascript_vm }.with(|_| ()).is_none() {
+            return;
+        }
         http::defer_shutdown_reclaim(this.cast(), FetchTasklet::deinit_erased);
     }
 
