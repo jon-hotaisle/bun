@@ -76,21 +76,18 @@ mod tests {
         for _ in 0..64 {
             let gate = Arc::new(ShutdownGate::new());
             let inside = Arc::new(AtomicUsize::new(0));
-            let rejected = Arc::new(AtomicUsize::new(0));
             let guests: Vec<_> = (0..8)
                 .map(|_| {
-                    let (gate, inside, rejected) = (gate.clone(), inside.clone(), rejected.clone());
+                    let (gate, inside) = (Arc::clone(&gate), Arc::clone(&inside));
                     std::thread::spawn(move || {
                         for _ in 0..500 {
-                            if gate.enter() {
-                                inside.fetch_add(1, Ordering::SeqCst);
-                                std::hint::spin_loop();
-                                inside.fetch_sub(1, Ordering::SeqCst);
-                                gate.leave();
-                            } else {
-                                rejected.fetch_add(1, Ordering::SeqCst);
+                            if !gate.enter() {
                                 return;
                             }
+                            inside.fetch_add(1, Ordering::SeqCst);
+                            std::hint::spin_loop();
+                            inside.fetch_sub(1, Ordering::SeqCst);
+                            gate.leave();
                         }
                     })
                 })

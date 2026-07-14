@@ -152,6 +152,7 @@ const workPoolJobs: [name: string, source: string][] = [
   ["node:zlib", "require('node:zlib').gzip(Buffer.alloc(1 << 16, 7), swallow);"],
   ["node:fs", "require('node:fs/promises').stat(process.execPath).then(swallow, swallow);"],
   ["node:dns", "require('node:dns').promises.lookup('localhost').then(swallow, swallow);"],
+  ["node:crypto", "require('node:crypto').pbkdf2('pw', 'salt', 25000, 64, 'sha512', swallow);"],
 ];
 for (const [name, job] of workPoolJobs) {
   test(

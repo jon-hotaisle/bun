@@ -25,7 +25,6 @@ use bun_core::env::OperatingSystem;
 use bun_io::KeepAlive;
 use bun_jsc::AnyTask::AnyTask;
 use bun_jsc::WorkPool;
-use bun_jsc::event_loop::EventLoop;
 use bun_jsc::{self as jsc, JSGlobalObject, JSPromise, JSValue};
 use bun_options_types::WindowsOptions;
 use bun_options_types::schema::api;
@@ -59,9 +58,8 @@ pub struct JSBundleCompletionTask {
     // `unsafe impl Send` below for the thread-affinity constraint this imposes.
     pub ref_count: RefCount<Self>,
     pub config: JSBundlerConfig,
-    // BACKREF — the JS-thread `EventLoop` outlives every completion task; safe
-    // `Deref` so call sites read `self.jsc_event_loop.enqueue_task_concurrent(..)`.
-    pub jsc_event_loop: BackRef<EventLoop>,
+    /// Cross-thread handle to the owning VM; see [`bun_jsc::vm_handle::VMHandle`].
+    pub vm: bun_jsc::vm_handle::VMHandle,
     pub task: AnyTask,
     pub global_this: BackRef<JSGlobalObject>,
     pub promise: jsc::JSPromiseStrong,
@@ -116,16 +114,13 @@ pub(crate) fn create_and_schedule_completion_task(
     config: JSBundlerConfig,
     plugins: Option<NonNull<Plugin>>,
     global_this: &JSGlobalObject,
-    event_loop: *mut EventLoop,
 ) -> crate::Result<*mut JSBundleCompletionTask> {
     let vm = global_this.bun_vm_ptr();
     let env = global_this.bun_vm().transpiler.env;
     let completion = bun_core::heap::into_raw(Box::new(JSBundleCompletionTask {
         ref_count: RefCount::init(),
         config,
-        // `event_loop` is the live JS-thread loop (caller derives it from
-        // `vm.event_loop()`); never null once `Bun.build` is reachable.
-        jsc_event_loop: BackRef::from(core::ptr::NonNull::new(event_loop).expect("event_loop")),
+        vm: global_this.bun_vm().cross_thread_handle(),
         task: AnyTask::default(),
         global_this: BackRef::new(global_this),
         promise: jsc::JSPromiseStrong::default(),
@@ -170,9 +165,8 @@ pub fn generate_from_javascript(
     config: JSBundlerConfig,
     plugins: Option<NonNull<Plugin>>,
     global_this: &JSGlobalObject,
-    event_loop: *mut EventLoop,
 ) -> crate::Result<JSValue> {
-    let completion = create_and_schedule_completion_task(config, plugins, global_this, event_loop)?;
+    let completion = create_and_schedule_completion_task(config, plugins, global_this)?;
     // SAFETY: `completion` is the freshly-boxed allocation; sole owner on the JS
     // thread until the enqueued task runs.
     unsafe {
@@ -784,13 +778,18 @@ fn from_completion_handle<'a>(c: NonNull<Bv2OpaqueCompletion>) -> &'a JSBundleCo
 static COMPLETION_VTABLE: dispatch::CompletionDispatch = dispatch::CompletionDispatch {
     result_is_err: |c| matches!(from_completion_handle(c).result, BundleV2Result::Err(_)),
     enqueue_task_concurrent: |c, task| {
-        // `jsc_event_loop` is a `BackRef<EventLoop>` — safe Deref.
         // SAFETY: `task` is a fresh heap-allocated non-null `ConcurrentTaskItem`
-        // passed through from the bundler vtable; the queue takes ownership.
-        unsafe {
-            from_completion_handle(c)
-                .jsc_event_loop
-                .enqueue_task_concurrent(core::ptr::NonNull::new_unchecked(task))
+        // passed through from the bundler vtable; on success the queue takes
+        // ownership, on `false` (worker VM destroyed) it is parked with the
+        // completion per the `VMHandle::enqueue_task_concurrent` policy.
+        let completion = from_completion_handle(c);
+        let queued = completion.vm.enqueue_task_concurrent(|| {
+            // SAFETY: `task` is non-null per the vtable contract (fresh heap
+            // allocation from the bundler side).
+            unsafe { core::ptr::NonNull::new_unchecked(task) }
+        });
+        if !queued {
+            bun_jsc::vm_handle::park_leak(task.cast());
         }
     },
 };
@@ -1003,11 +1002,15 @@ impl CompletionStruct for JSBundleCompletionTask {
     }
 
     fn complete_on_bundle_thread(&mut self) {
-        // `jsc_event_loop` is a `BackRef<EventLoop>` — safe Deref.
-        // `ConcurrentTask::create` heap-allocates a fresh task; the
-        // queue takes ownership of it.
-        self.jsc_event_loop
-            .enqueue_task_concurrent(jsc::ConcurrentTask::create(self.task.task()));
+        // On success, `ConcurrentTask::create` heap-allocates a fresh task and
+        // the queue takes ownership; on `false` (worker VM destroyed) the
+        // completion is parked per the `VMHandle::enqueue_task_concurrent`
+        // policy.
+        let vm = self.vm.clone();
+        let any_task = self.task.task();
+        if !vm.enqueue_task_concurrent(|| jsc::ConcurrentTask::create(any_task)) {
+            bun_jsc::vm_handle::park_leak(core::ptr::from_mut(self).cast());
+        }
     }
     fn set_result(&mut self, result: BundleV2Result) {
         self.result = result;

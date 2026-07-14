@@ -2500,8 +2500,9 @@ impl FetchTasklet {
             if is_done {
                 // No on_progress_update will ever run for this final result, so
                 // release the JS-side ref it would have dropped, then the
-                // HTTP-side ref. The 1→0 transition runs `dealloc_for_shutdown`
-                // (Rust boxes only — JSC handles are leaked to destructOnExit).
+                // HTTP-side ref. The 1→0 transition routes through
+                // `dealloc_for_shutdown` (main VM: parked for the exit drain;
+                // destroyed worker VM: parked as an intentional leak).
                 // SAFETY: `task` is the live heap tasklet; both refs held.
                 FetchTasklet::deref_from_thread(task);
                 // SAFETY: second ref still held until this 1→0 transition.

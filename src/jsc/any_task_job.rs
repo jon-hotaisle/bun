@@ -15,7 +15,7 @@ use bun_io::KeepAlive;
 use bun_threading::work_pool::{IntrusiveWorkTask as _, Task as WorkPoolTask, WorkPool};
 
 use crate::event_loop::ConcurrentTask;
-use crate::{JSGlobalObject, JsResult, VirtualMachineRef as VirtualMachine};
+use crate::{JSGlobalObject, JsResult};
 
 /// Per-job payload trait. Implementors own the off-thread work body and the
 /// JS-thread completion; the surrounding heap/queue/keep-alive plumbing is
@@ -48,7 +48,11 @@ pub trait AnyTaskJobCtx: Sized {
 /// `run_from_js` (or on `init` failure). `ctx` is `pub` so callers can read
 /// e.g. a `JSPromiseStrong` field after scheduling.
 pub struct AnyTaskJob<C> {
-    vm: bun_ptr::BackRef<VirtualMachine>,
+    /// Cross-thread handle to the owning VM; see [`crate::vm_handle::VMHandle`].
+    vm: crate::vm_handle::VMHandle,
+    /// JSC_BORROW — forwarded to `ctx.run` off-thread (FFI reads only); the
+    /// pool must not touch the VM through it.
+    global: *mut crate::JSGlobalObject,
     task: WorkPoolTask,
     any_task: AnyTask,
     poll: KeepAlive,
@@ -72,9 +76,10 @@ impl<C: AnyTaskJobCtx> AnyTaskJob<C> {
     /// (running `Drop for C`). The returned pointer is owned by the caller
     /// until handed to [`Self::schedule`].
     pub fn create(global: &JSGlobalObject, ctx: C) -> JsResult<*mut Self> {
-        let vm = bun_ptr::BackRef::new(global.bun_vm());
+        let vm = global.bun_vm().cross_thread_handle();
         let job = bun_core::heap::into_raw(Box::new(Self {
             vm,
+            global: core::ptr::from_ref(global).cast_mut(),
             task: WorkPoolTask {
                 node: Default::default(),
                 callback: Self::run_task,
@@ -139,12 +144,15 @@ impl<C: AnyTaskJobCtx> AnyTaskJob<C> {
         // in `create`; `task` points to `Self.task` and the job is live until
         // `run_from_js` reclaims it.
         let job = unsafe { &mut *Self::from_task_ptr(task) };
-        let vm = job.vm;
-        job.ctx.run(vm.global);
-        // `ConcurrentTask::create` heap-allocates a fresh task; the queue takes
-        // ownership of it.
-        vm.event_loop_shared()
-            .enqueue_task_concurrent(ConcurrentTask::create(job.any_task.task()));
+        let vm = job.vm.clone();
+        job.ctx.run(job.global);
+        // On success, `ConcurrentTask::create` heap-allocates a fresh task and
+        // the queue takes ownership; on `false` (worker VM destroyed) the job
+        // is parked per the `VMHandle::enqueue_task_concurrent` policy.
+        let any_task = job.any_task.task();
+        if !vm.enqueue_task_concurrent(|| ConcurrentTask::create(any_task)) {
+            crate::vm_handle::park_leak(core::ptr::from_mut(job).cast());
+        }
     }
 
     /// `AnyTask` callback — runs ON the JS thread. Reclaims the heap
@@ -154,8 +162,12 @@ impl<C: AnyTaskJobCtx> AnyTaskJob<C> {
         // SAFETY: `this` was produced by `heap::into_raw` in `create` and is
         // uniquely owned here (the `AnyTask` fires exactly once).
         let mut this = unsafe { bun_core::heap::take(this) };
-        let vm = this.vm;
-        if vm.is_shutting_down() {
+        // JS thread: same-thread access.
+        let vm = this.vm.vm();
+        // Also bail while a worker.terminate() request is pending: `then`
+        // resolves promises, and entering JSC with the termination exception
+        // set trips exception-scope asserts.
+        if vm.is_shutting_down() || vm.jsc_vm().has_termination_request() {
             return Ok(());
         }
         this.ctx.then(vm.global())

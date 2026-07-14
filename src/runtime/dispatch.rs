@@ -1163,13 +1163,21 @@ pub(crate) fn __bun_release_task_at_shutdown(task: bun_event_loop::Task) -> bool
         // posted this entry, then deref'd its own +1 if final; the JS-side
         // +1 it expected `on_progress_update` to drop is the one we release
         // here. Runs on the JS thread, so the plain `deref` (→ `deinit` on
-        // 1→0) is the right teardown path; the HTTP daemon is already
-        // parked (`shutdown_for_exit` precedes `destroy`), so the
-        // `Box<AsyncHTTP>` and any `metadata` it owns are exclusively ours.
+        // 1→0) is the right teardown path. On the main-exit caller the HTTP
+        // daemon is already parked; on the worker-shutdown caller it is not,
+        // but the HTTP side then still holds its own ref, so the deref here
+        // cannot free the tasklet under it.
         task_tag::FetchTasklet => {
-            // SAFETY: `task.ptr` is the live heap `FetchTasklet`; HTTP daemon is
-            // already parked so we hold the sole reference.
-            FetchTasklet::deref(task.ptr.cast::<FetchTasklet>());
+            let tasklet = task.ptr.cast::<FetchTasklet>();
+            // Un-stick the schedule flag first (while our ref keeps the
+            // tasklet alive): the next HTTP-thread callback can then win the
+            // CAS, observe the closed gate, and abort the transfer.
+            // SAFETY: `task.ptr` is the live heap `FetchTasklet`; the ref this
+            // queued entry owns is released just below.
+            unsafe { &*tasklet }
+                .has_schedule_callback
+                .store(false, core::sync::atomic::Ordering::Release);
+            FetchTasklet::deref(tasklet);
             true
         }
         // `AsyncFSTask`s are `Box::leak`'d in `create()` and freed by

@@ -1267,11 +1267,8 @@ mod _async_tasks {
         pub const HAVE_ABORT_SIGNAL: bool = A::HAVE_ABORT_SIGNAL;
         pub const HEAP_LABEL: &'static str = F.heap_label();
 
-        /// Deref the raw `global_object` pointer.
-        ///
-        /// Invariant: set from a live `&JSGlobalObject` in `create()` and never
-        /// null; the JSC global outlives every task (JSC_BORROW per LIFETIMES.tsv).
-        /// Safe to call from the work-pool thread for `bun_vm_concurrently()`.
+        /// Deref the raw `global_object` pointer. JS-thread only — cross-thread
+        /// VM access goes through the `vm: VMHandle` field.
         #[inline]
         pub fn global_object(&self) -> &JSGlobalObject {
             self.global_object.get()
@@ -2303,14 +2300,8 @@ mod _async_tasks {
             Box::new(init)
         }
 
-        /// Borrow the owning `JSGlobalObject`.
-        ///
-        /// SAFETY: `global_object` is set from a live `&JSGlobalObject` in
-        /// `create()` (never null) and the JSC_BORROW invariant (LIFETIMES.tsv)
-        /// guarantees the global outlives every task it spawns. The pointee is a
-        /// pinned JSC heap object; `bun_vm_concurrently()` is the only method we
-        /// call off-thread and it reads init-immutable state, so a shared borrow
-        /// is sound from both the JS thread and the work pool.
+        /// Borrow the owning `JSGlobalObject`. JS-thread only — cross-thread
+        /// VM access goes through the `vm: VMHandle` field.
         #[inline]
         pub fn global_object(&self) -> &JSGlobalObject {
             self.global_object.get()
