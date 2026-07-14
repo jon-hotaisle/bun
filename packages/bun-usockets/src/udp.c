@@ -56,6 +56,14 @@ int us_udp_socket_send(struct us_udp_socket_t *s, void** payloads, size_t* lengt
         // TODO nohang flag?
         int sent = bsd_sendmmsg(fd, buf, MSG_DONTWAIT);
         if (sent < 0) {
+            /* Nothing went out at all. Only the partial-send path below used to
+             * re-arm, so a first-packet failure -- the single-packet case, e.g.
+             * a lone CONNECTION_CLOSE -- registered no writable event and the
+             * drain never fired. The caller then waits out its own send
+             * failsafe (a full second in lsquic) with nothing to wake it. */
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
+                us_poll_change((struct us_poll_t *) s, s->loop, LIBUS_SOCKET_READABLE | LIBUS_SOCKET_WRITABLE);
+            }
             return total_sent > 0 ? total_sent : sent;
         }
         total_sent += sent;

@@ -723,8 +723,8 @@ lsquic_callback! {
                         *e = libc::EAGAIN;
                     }
                 }
-                // `us_udp_socket_send` re-arms WRITABLE on a short send, so
-                // `on_drain` resumes us when the socket clears.
+                // `us_udp_socket_send` re-arms WRITABLE whenever it cannot
+                // place a packet, so `on_drain` resumes us as the socket clears.
                 break;
             }
             this.add_stat(IDX_STATS_PACKETS_SENT, 1);
@@ -1361,6 +1361,16 @@ impl QuicEndpoint {
             if !engine.is_null() {
                 // SAFETY: engine is live while the endpoint is.
                 unsafe { lsquic::lsquic_engine_process_conns(engine) };
+                // A blocked UDP send parks packets in lsquic's unsent queue,
+                // which only the writable drain flushes. A frame whose session
+                // is already torn down (a destroy()'s CONNECTION_CLOSE) has no
+                // one left to drive that drain, so retry on every tick rather
+                // than rely on a writable event arriving.
+                // SAFETY: as above.
+                if unsafe { lsquic::lsquic_engine_has_unsent_packets(engine) } != 0 {
+                    // SAFETY: as above.
+                    unsafe { lsquic::lsquic_engine_send_unsent_packets(engine) };
+                }
             }
         }
         self.processing.set(false);
