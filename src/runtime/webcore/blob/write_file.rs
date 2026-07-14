@@ -1,5 +1,5 @@
-use core::ffi::c_void;
 use bun_sys::FdExt as _;
+use core::ffi::c_void;
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicU8;
 #[cfg(not(windows))]

@@ -287,8 +287,10 @@ mod _impl {
                 // Gate closed ⇒ owning VM torn down: forget the dead handle
                 // slots instead of releasing them (see NativeZlib::deinit).
                 if boxed.vm.with(|_| ()).is_none() {
-                    let _ = core::mem::ManuallyDrop::new(boxed.this_value.replace(Default::default()));
-                    let _ = core::mem::ManuallyDrop::new(boxed.poll_ref.replace(Default::default()));
+                    let _ =
+                        core::mem::ManuallyDrop::new(boxed.this_value.replace(Default::default()));
+                    let _ =
+                        core::mem::ManuallyDrop::new(boxed.poll_ref.replace(Default::default()));
                 }
                 drop(boxed);
             }

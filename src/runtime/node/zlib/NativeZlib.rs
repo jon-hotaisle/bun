@@ -271,8 +271,10 @@ mod _impl {
                 // forgotten, not released (this can run on a pool thread or
                 // on the worker thread mid-teardown).
                 if boxed.vm.with(|_| ()).is_none() {
-                    let _ = core::mem::ManuallyDrop::new(boxed.this_value.replace(Default::default()));
-                    let _ = core::mem::ManuallyDrop::new(boxed.poll_ref.replace(Default::default()));
+                    let _ =
+                        core::mem::ManuallyDrop::new(boxed.this_value.replace(Default::default()));
+                    let _ =
+                        core::mem::ManuallyDrop::new(boxed.poll_ref.replace(Default::default()));
                 }
                 drop(boxed);
             }

@@ -83,8 +83,9 @@ impl AnyTask {
     ) -> Self {
         let mut task = Self::from_typed(ctx, callback);
         // SAFETY: same ABI argument as `from_typed`'s callback transmute.
-        task.dispose =
-            Some(unsafe { core::mem::transmute::<unsafe fn(*mut T), unsafe fn(*mut c_void)>(dispose) });
+        task.dispose = Some(unsafe {
+            core::mem::transmute::<unsafe fn(*mut T), unsafe fn(*mut c_void)>(dispose)
+        });
         task
     }
 }

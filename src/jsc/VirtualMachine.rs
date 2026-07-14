@@ -2174,8 +2174,7 @@ impl VirtualMachine {
             let _ = (*regular).tasks.ensure_unused_capacity(64);
             addr_of_mut!((*vm).event_loop).write(regular);
 
-            addr_of_mut!((*vm).live_fetch_tasklets)
-                .write(core::cell::RefCell::new(Vec::new()));
+            addr_of_mut!((*vm).live_fetch_tasklets).write(core::cell::RefCell::new(Vec::new()));
             addr_of_mut!((*vm).handle_gate).write(Some(std::sync::Arc::new(
                 bun_threading::ShutdownGate::new(),
             )));

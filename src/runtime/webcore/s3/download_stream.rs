@@ -366,7 +366,9 @@ unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for S3HttpDownloadStream
             // so abort and let the final callback re-enter here to free.
             // SAFETY: `this` stays live; only atomics are touched.
             unsafe {
-                (*this).has_schedule_callback.store(false, Ordering::Release);
+                (*this)
+                    .has_schedule_callback
+                    .store(false, Ordering::Release);
                 bun_http::http_thread().schedule_shutdown_by_id((*this).async_http_id);
             }
             return;

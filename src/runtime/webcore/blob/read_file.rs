@@ -1,5 +1,5 @@
-use core::ffi::c_void;
 use bun_sys::FdExt as _;
+use core::ffi::c_void;
 use core::marker::PhantomData;
 #[cfg(windows)]
 use core::mem::MaybeUninit;

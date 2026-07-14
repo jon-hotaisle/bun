@@ -313,8 +313,10 @@ mod _impl {
                         _ => {}
                     });
                     let boxed = bun_core::heap::take(this);
-                    let _ = core::mem::ManuallyDrop::new(boxed.this_value.replace(Default::default()));
-                    let _ = core::mem::ManuallyDrop::new(boxed.poll_ref.replace(Default::default()));
+                    let _ =
+                        core::mem::ManuallyDrop::new(boxed.this_value.replace(Default::default()));
+                    let _ =
+                        core::mem::ManuallyDrop::new(boxed.poll_ref.replace(Default::default()));
                     drop(boxed);
                 }
                 return;

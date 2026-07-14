@@ -117,9 +117,8 @@ macro_rules! s3_dispose_promise_store_ctx {
         let ptr: *mut ::core::ffi::c_void = $ptr;
         // SAFETY: same heap ctx the callback would have consumed; sole owner.
         #[allow(unused_unsafe)]
-        let this = ::core::mem::ManuallyDrop::new(*unsafe {
-            ::bun_core::heap::take(ptr.cast::<$ty>())
-        });
+        let this =
+            ::core::mem::ManuallyDrop::new(*unsafe { ::bun_core::heap::take(ptr.cast::<$ty>()) });
         // SAFETY: `store` is read out exactly once.
         #[allow(unused_unsafe)]
         // SAFETY: single read of the suppressed value.

@@ -724,8 +724,7 @@ impl ErrorDeferred {
         fn cleanup(p: *mut core::ffi::c_void) {
             // SAFETY: `p` is the heap `Context` enqueued below, unrun.
             let mut ctx = unsafe { bun_core::heap::take(p.cast::<Context>()) };
-            let _ =
-                core::mem::ManuallyDrop::new(core::mem::take(&mut ctx.deferred.promise));
+            let _ = core::mem::ManuallyDrop::new(core::mem::take(&mut ctx.deferred.promise));
             drop(ctx);
         }
 
@@ -736,14 +735,13 @@ impl ErrorDeferred {
         // TODO(@heimskr): new custom Task type
         // SAFETY: `bun_vm()` returns a non-null VM pointer (VM-owned for the lifetime of
         // the JSGlobalObject).
-        global_this
-            .bun_vm()
-            .as_mut()
-            .enqueue_task(bun_jsc::ManagedTask::ManagedTask::new_with_cleanup(
+        global_this.bun_vm().as_mut().enqueue_task(
+            bun_jsc::ManagedTask::ManagedTask::new_with_cleanup(
                 context,
                 Context::callback,
                 cleanup,
-            ));
+            ),
+        );
     }
 }
 
