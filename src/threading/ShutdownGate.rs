@@ -79,8 +79,7 @@ mod tests {
             let rejected = Arc::new(AtomicUsize::new(0));
             let guests: Vec<_> = (0..8)
                 .map(|_| {
-                    let (gate, inside, rejected) =
-                        (gate.clone(), inside.clone(), rejected.clone());
+                    let (gate, inside, rejected) = (gate.clone(), inside.clone(), rejected.clone());
                     std::thread::spawn(move || {
                         for _ in 0..500 {
                             if gate.enter() {
