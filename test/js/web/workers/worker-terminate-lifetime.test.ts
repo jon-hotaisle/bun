@@ -132,7 +132,8 @@ test(
     });
 
     // stderr is drained but not asserted: ASAN/debug builds emit benign noise.
-    const [stdout, _stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    if (exitCode !== 0) console.error("child stderr:\n" + stderr);
     expect(stdout).toBe("done\n");
     expect(exitCode).toBe(0);
   },
@@ -176,7 +177,8 @@ test(
     });
 
     // stderr is drained but not asserted: ASAN/debug builds emit benign noise.
-    const [stdout, _stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    if (exitCode !== 0) console.error("child stderr:\n" + stderr);
     expect(stdout).toBe("done\n");
     expect(exitCode).toBe(0);
   },
