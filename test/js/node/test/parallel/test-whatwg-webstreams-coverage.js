@@ -27,37 +27,33 @@ assert.throws(() => {
   Reflect.get(ByteLengthQueuingStrategy.prototype, 'highWaterMark', {});
 }, {
   name: 'TypeError',
-  // Bun: JavaScriptCore brand-check failures use a different message than
-  // V8's "Cannot read private member"; only the error type is asserted.
+  // Bun: JavaScriptCore's brand-check failure message differs from V8's
+  // "Cannot read private member"; only the error type is asserted.
 });
 
-// Bun: `ByteLengthQueuingStrategy.prototype.size` is a plain method rather than a
-// brand-checked accessor, so getting it with a foreign receiver does not throw.
-if (typeof Bun === 'undefined') {
-  assert.throws(() => {
-    Reflect.get(ByteLengthQueuingStrategy.prototype, 'size', {});
-  }, {
-    name: 'TypeError',
-  });
-}
+assert.throws(() => {
+  Reflect.get(ByteLengthQueuingStrategy.prototype, 'size', {});
+}, {
+  name: 'TypeError',
+  // Bun: JavaScriptCore's brand-check failure message differs from V8's
+  // "Cannot read private member"; only the error type is asserted.
+});
 
 assert.throws(() => {
   Reflect.get(CountQueuingStrategy.prototype, 'highWaterMark', {});
 }, {
   name: 'TypeError',
-  // Bun: JavaScriptCore brand-check failures use a different message than
-  // V8's "Cannot read private member"; only the error type is asserted.
+  // Bun: JavaScriptCore's brand-check failure message differs from V8's
+  // "Cannot read private member"; only the error type is asserted.
 });
 
-// Bun: `CountQueuingStrategy.prototype.size` is a plain method rather than a
-// brand-checked accessor, so getting it with a foreign receiver does not throw.
-if (typeof Bun === 'undefined') {
-  assert.throws(() => {
-    Reflect.get(CountQueuingStrategy.prototype, 'size', {});
-  }, {
-    name: 'TypeError',
-  });
-}
+assert.throws(() => {
+  Reflect.get(CountQueuingStrategy.prototype, 'size', {});
+}, {
+  name: 'TypeError',
+  // Bun: JavaScriptCore's brand-check failure message differs from V8's
+  // "Cannot read private member"; only the error type is asserted.
+});
 
 // Custom Inspect Works
 
