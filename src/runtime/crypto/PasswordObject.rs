@@ -606,10 +606,13 @@ impl<Op: PasswordOp> PasswordJob<Op> {
         // `false` (worker VM destroyed) it is leaked per the
         // `VMHandle::enqueue_task_concurrent` policy.
         let vm = self.vm.clone();
-        let _ = vm.enqueue_task_concurrent(|| {
+        let queued = vm.enqueue_task_concurrent(|| {
             // SAFETY: `result` is the live heap allocation initialised above.
             ConcurrentTask::create_from(unsafe { core::ptr::addr_of_mut!((*result).task) })
         });
+        if !queued {
+            bun_jsc::vm_handle::park_leak(result.cast());
+        }
         // `self: Box<Self>` drops here; Drop runs secure_zero on password (+op).
     }
 }

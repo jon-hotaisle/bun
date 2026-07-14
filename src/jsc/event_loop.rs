@@ -770,19 +770,16 @@ impl EventLoop {
 
     pub fn deinit(&mut self) {
         // Free (don't run — running could re-enter the dying VM) queued
-        // ManagedTask boxes. Other tags are left in place: they were re-queued
-        // by `release_queued_tasks_for_shutdown` because their callback can't
-        // be no-op-dispatched safely (`AnyTask` callbacks call into JS) and
-        // their box may be aliased by the originator. Keeping them in
-        // `self.tasks` (a field of the static-rooted `VirtualMachine` box that
-        // is never `dealloc`'d) leaves the chain reachable to LSan — the same
-        // visibility they had via `concurrent_tasks` before
-        // `drop_concurrent_cpp_tasks` drained it. CppTasks must NOT be deleted
-        // here: this runs after JSC VM teardown on both worker and main paths,
-        // and a Worker dispatchExit task's `~Ref<Worker>` would walk freed
-        // WeakBlock storage via `~JSEventListener`. They are reclaimed before
-        // teardown by `release_queued_tasks_for_shutdown`'s CppTask arm.
-        let mut requeue: Vec<bun_event_loop::Task> = Vec::new();
+        // ManagedTask boxes. Other tags can't be freed here: their callback
+        // can't be no-op-dispatched safely (`AnyTask` callbacks call into JS)
+        // and their box may be aliased by the originator — park them in the
+        // intentional-leak registry so the leak stays reachable to LSan even
+        // after a worker VM's box (and this queue's buffers) is raw-dealloc'd.
+        // CppTasks must NOT be deleted here: this runs after JSC VM teardown
+        // on both worker and main paths, and a Worker dispatchExit task's
+        // `~Ref<Worker>` would walk freed WeakBlock storage via
+        // `~JSEventListener`. They are reclaimed before teardown by
+        // `release_queued_tasks_for_shutdown`'s CppTask arm.
         while let Some(task) = self.tasks.read_item() {
             if task.tag == bun_event_loop::task_tag::ManagedTask {
                 // SAFETY: every ManagedTask is heap_owned (ManagedTask::new -> heap::into_raw).
@@ -793,14 +790,11 @@ impl EventLoop {
                 }
                 drop(managed);
             } else {
-                requeue.push(task);
+                crate::vm_handle::park_leak(task.ptr.cast());
             }
         }
         // Reassigning a fresh value drops the old buffers in place.
         self.tasks = Queue::init();
-        for task in requeue {
-            let _ = self.tasks.write_item(task);
-        }
         let pending = core::mem::take(&mut self.immediate_tasks);
         let next = core::mem::take(&mut self.next_immediate_tasks);
         if !pending.is_empty() || !next.is_empty() {

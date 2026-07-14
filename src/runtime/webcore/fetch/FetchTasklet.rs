@@ -536,6 +536,7 @@ impl FetchTasklet {
         // gate is open here (its teardown postdates the HTTP daemon park).
         // SAFETY: `this` is live per the caller contract.
         if unsafe { &(*this).javascript_vm }.with(|_| ()).is_none() {
+            bun_jsc::vm_handle::park_leak(this.cast());
             return;
         }
         http::defer_shutdown_reclaim(this.cast(), FetchTasklet::deinit_erased);

@@ -482,7 +482,9 @@ impl<T: CompressionStreamImpl> CompressionStream<T> {
         // `this` is the heap `m_ctx` payload, kept alive by `write()`'s ref
         // until `run_from_js_thread` derefs. On `false` (worker VM destroyed)
         // it is leaked per the `VMHandle::enqueue_task_concurrent` policy.
-        let _ = vm.enqueue_task_concurrent(|| ConcurrentTask::create(Task::init(this)));
+        if !vm.enqueue_task_concurrent(|| ConcurrentTask::create(Task::init(this))) {
+            bun_jsc::vm_handle::park_leak(this.cast());
+        }
     }
 
     /// Dispatched from `dispatch.rs` when the worker-thread `do_work()` posts

@@ -1317,9 +1317,10 @@ mod _async_tasks {
             // On `false` (worker VM destroyed) the task is leaked per the
             // `VMHandle::enqueue_task_concurrent` policy.
             let vm = this.vm.clone();
-            let _ = vm.enqueue_task_concurrent(|| {
-                ConcurrentTask::create_from(std::ptr::from_mut::<Self>(this))
-            });
+            let this_ptr = std::ptr::from_mut::<Self>(this);
+            if !vm.enqueue_task_concurrent(|| ConcurrentTask::create_from(this_ptr)) {
+                bun_jsc::vm_handle::park_leak(this_ptr.cast());
+            }
         }
 
         pub fn run_from_js_thread(&mut self) -> Result<(), bun_jsc::JsTerminated> {
@@ -2555,7 +2556,9 @@ mod _async_tasks {
             // `VMHandle::enqueue_task_concurrent` policy.
             let vm = self.vm.clone();
             let this_ptr = std::ptr::from_mut::<Self>(self);
-            let _ = vm.enqueue_task_concurrent(|| ConcurrentTask::create(Task::init(this_ptr)));
+            if !vm.enqueue_task_concurrent(|| ConcurrentTask::create(Task::init(this_ptr))) {
+                bun_jsc::vm_handle::park_leak(this_ptr.cast());
+            }
         }
 
         fn clear_result_list(&mut self) {

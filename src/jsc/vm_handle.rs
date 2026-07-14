@@ -72,14 +72,19 @@ impl VMHandle {
 
     /// [`Self::enqueue_task_concurrent`] for the common shape where the task
     /// is `owner`'s inline intrusive `concurrent_task` field: on `false` the
-    /// field is left untouched and `owner` follows the leak policy above.
+    /// field is left untouched and `owner` is parked via [`park_leak`].
     pub fn enqueue_intrusive<T: bun_event_loop::Taskable>(
         &self,
         ct: &mut crate::event_loop::ConcurrentTaskItem,
         owner: *mut T,
     ) -> bool {
         use bun_event_loop::ConcurrentTask::AutoDeinit;
-        self.enqueue_task_concurrent(|| NonNull::from(ct.from(owner, AutoDeinit::ManualDeinit)))
+        let queued =
+            self.enqueue_task_concurrent(|| NonNull::from(ct.from(owner, AutoDeinit::ManualDeinit)));
+        if !queued {
+            park_leak(owner.cast());
+        }
+        queued
     }
 
     /// The VM, without the gate. Only callable on the VM's own JS thread,
@@ -94,4 +99,19 @@ impl VMHandle {
         // after it stops running JS (worker shutdown / process exit).
         unsafe { self.vm.as_ref() }
     }
+}
+
+/// Intentional-leak registry for completion objects whose owning worker VM
+/// was destroyed (the `enqueue_task_concurrent == false` policy): their JSC
+/// handles cannot be dropped off the JS thread, so the box is never freed.
+/// Parking the address here keeps the allocation reachable, so LeakSanitizer
+/// reports stay actionable instead of flagging every deliberate leak. Never
+/// drained; bounded by jobs in flight at worker terminate.
+static PARKED_LEAKS: bun_threading::Guarded<alloc::vec::Vec<usize>> =
+    bun_threading::Guarded::new(alloc::vec::Vec::new());
+
+extern crate alloc;
+
+pub fn park_leak(ptr: *mut core::ffi::c_void) {
+    PARKED_LEAKS.lock().push(ptr as usize);
 }

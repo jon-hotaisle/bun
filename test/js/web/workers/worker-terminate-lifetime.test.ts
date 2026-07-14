@@ -90,29 +90,31 @@ test(
 test(
   "terminating a worker with fetches in flight does not UAF the worker VM",
   async () => {
+    // The server lives in the test process: the LeakSanitizer-validated child
+    // would otherwise report Bun.serve's intentional exit leaks.
+    using server = Bun.serve({
+      port: 0,
+      fetch() {
+        // Drip the body forever so responses are always mid-flight when
+        // the worker is terminated.
+        return new Response(
+          new ReadableStream({
+            async pull(controller) {
+              controller.enqueue(new Uint8Array(1024));
+              await Bun.sleep(1);
+            },
+          }),
+        );
+      },
+    });
     await using proc = Bun.spawn({
       cmd: [
         bunExe(),
         "-e",
         `
-        using server = Bun.serve({
-          port: 0,
-          fetch() {
-            // Drip the body forever so responses are always mid-flight when
-            // the worker is terminated.
-            return new Response(
-              new ReadableStream({
-                async pull(controller) {
-                  controller.enqueue(new Uint8Array(1024));
-                  await Bun.sleep(1);
-                },
-              }),
-            );
-          },
-        });
         const workerSource =
           "for (let i = 0; i < 16; i++) " +
-          "fetch(" + JSON.stringify(server.url.href) + ").then(r => r.text().catch(() => {}), () => {});" +
+          "fetch(" + JSON.stringify(process.env.DRIP_SERVER_URL) + ").then(r => r.text().catch(() => {}), () => {});" +
           "postMessage('fetching');";
         const url = "data:text/javascript," + encodeURIComponent(workerSource);
         for (let i = 0; i < ${perRound}; i++) {
@@ -123,10 +125,9 @@ test(
           w.terminate();
         }
         console.log("done");
-        process.exit(0);
       `,
       ],
-      env: bunEnv,
+      env: { ...bunEnv, DRIP_SERVER_URL: server.url.href },
       stdout: "pipe",
       stderr: "pipe",
     });
