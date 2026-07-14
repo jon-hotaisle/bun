@@ -79,8 +79,8 @@ impl VMHandle {
         owner: *mut T,
     ) -> bool {
         use bun_event_loop::ConcurrentTask::AutoDeinit;
-        let queued =
-            self.enqueue_task_concurrent(|| NonNull::from(ct.from(owner, AutoDeinit::ManualDeinit)));
+        let queued = self
+            .enqueue_task_concurrent(|| NonNull::from(ct.from(owner, AutoDeinit::ManualDeinit)));
         if !queued {
             park_leak(owner.cast());
         }
