@@ -202,7 +202,9 @@ pub(crate) trait CompressionContext {
 // R-2 (host-fn re-entrancy): every JS-exposed mixin method takes `&T`; per-field
 // interior mutability via `Cell` (Copy) / `JsCell` (non-Copy). Accessors return the
 // cell wrapper so the mixin can `.get()`/`.set()`/`.with_mut()` as needed.
-pub(crate) trait CompressionStreamImpl: Sized + Taskable + 'static {
+pub(crate) trait CompressionStreamImpl:
+    Sized + Taskable + bun_jsc::vm_handle::DisposeAfterVmDestroyed + 'static
+{
     type Stream: CompressionContext;
 
     // Field accessors (interior-mutability cells; all `&self`).
@@ -481,9 +483,12 @@ impl<T: CompressionStreamImpl> CompressionStream<T> {
 
         // `this` is the heap `m_ctx` payload, kept alive by `write()`'s ref
         // until `run_from_js_thread` derefs. On `false` (worker VM destroyed)
-        // it is leaked per the `VMHandle::enqueue_task_concurrent` policy.
+        // it is freed here — the wrapper died with the heap and the write()
+        // ref can never be released.
         if !vm.enqueue_task_concurrent(|| ConcurrentTask::create(Task::init(this))) {
-            bun_jsc::vm_handle::park_leak(this.cast());
+            // SAFETY: sole owner — the queue never took the task and no JS
+            // thread exists for this VM anymore.
+            unsafe { T::dispose_after_vm_destroyed(this) };
         }
     }
 
@@ -971,6 +976,19 @@ macro_rules! __impl_compression_stream {
             const TAG: ::bun_event_loop::TaskTag = ::bun_event_loop::task_tag::$native;
         }
 
+        // SAFETY: releases exactly the write()'s ref per the trait contract.
+        unsafe impl ::bun_jsc::vm_handle::DisposeAfterVmDestroyed for $native {
+            unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
+                // Release the in-flight write()'s ref. The count is atomic —
+                // this may race the JS wrapper's finalizer during worker
+                // teardown — and whichever side hits zero frees the payload;
+                // the destroy target's off-JS-thread branch never touches
+                // the dead VM's handle slots.
+                // SAFETY: `this` is live (the write's ref pins it).
+                unsafe { <Self as $crate::node::node_zlib_binding::CompressionStreamImpl>::deref(this) };
+            }
+        }
+
         /// `T.js.*` — cached-property accessors emitted by
         /// `generate-classes.ts` for the `values:` list in `zlib.classes.ts`.
         #[allow(unused)]
@@ -1010,16 +1028,23 @@ macro_rules! __impl_compression_stream {
                 unsafe { ::bun_core::from_field_ptr!(Self, task, task) }
             }
 
-            // All three `Native*` structs `#[derive(bun_ptr::CellRefCounted)]`
-            // with their own `#[ref_count(destroy = …)]` (or the default
-            // `Box::from_raw` drop) — delegate so the macro doesn't hard-code
-            // a `Self::deinit(*mut Self)` signature that only one of them has.
-            #[inline] fn ref_(&self) { <Self as ::bun_ptr::CellRefCounted>::ref_(self) }
+            // All three `Native*` structs `#[derive(bun_ptr::ThreadSafeRefCounted)]`
+            // (atomic: the JS wrapper's finalizer and a work-pool completion
+            // can release refs from different threads at worker terminate)
+            // with their own `#[ref_count(destroy = …)]` — delegate so the
+            // macro doesn't hard-code a destroy signature.
+            #[inline] fn ref_(&self) {
+                // SAFETY: `self` is a live borrow of the heap m_ctx payload.
+                unsafe {
+                    <Self as ::bun_ptr::AnyRefCounted>::rc_ref(
+                        ::core::ptr::from_ref(self).cast_mut(),
+                    );
+                }
+            }
             #[inline] unsafe fn deref(this: *mut Self) {
                 // SAFETY: forwarded trait contract — `this` is live; the
-                // derived `CellRefCounted::deref` routes zero to the per-type
-                // `destroy`.
-                unsafe { <Self as ::bun_ptr::CellRefCounted>::deref(this) }
+                // derived deref routes zero to the per-type `destroy`.
+                unsafe { <Self as ::bun_ptr::AnyRefCounted>::rc_deref(this) }
             }
 
             #[inline] fn write_result_get_cached(this_value: ::bun_jsc::JSValue) -> Option<::bun_jsc::JSValue> {

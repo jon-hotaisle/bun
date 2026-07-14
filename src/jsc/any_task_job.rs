@@ -7,9 +7,6 @@
 //! `WorkTask`) — those go through the central `TaskTag` dispatch table, not
 //! the type-erased `AnyTask` path, and would need a per-instantiation tag.
 
-use core::ffi::c_void;
-use core::ptr::NonNull;
-
 use bun_event_loop::AnyTask::AnyTask;
 use bun_io::KeepAlive;
 use bun_threading::work_pool::{IntrusiveWorkTask as _, Task as WorkPoolTask, WorkPool};
@@ -41,6 +38,14 @@ pub trait AnyTaskJobCtx: Sized {
     /// loop, unless the VM is already shutting down. Any `Err` is surfaced as
     /// the `AnyTask` callback's result (i.e. propagated to the tick loop).
     fn then(&mut self, global: &JSGlobalObject) -> JsResult<()>;
+
+    /// Consume the ctx after the owning VM was destroyed (see
+    /// [`crate::vm_handle::DisposeAfterVmDestroyed`]): forget JSC handle
+    /// fields, free everything else. Runs off the JS thread.
+    ///
+    /// # Safety
+    /// The owning VM is gone; must not touch it or its loop.
+    unsafe fn dispose_for_dead_vm(self);
 }
 
 /// Heap-allocated `{WorkPoolTask, AnyTask, KeepAlive, ctx}` bundle. Created
@@ -60,6 +65,21 @@ pub struct AnyTaskJob<C> {
 }
 
 bun_threading::intrusive_work_task!([C] AnyTaskJob<C>, task);
+
+// SAFETY: frees `this` exactly once per the trait contract.
+unsafe impl<C: AnyTaskJobCtx> crate::vm_handle::DisposeAfterVmDestroyed for AnyTaskJob<C> {
+    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
+        // SAFETY: sole owner; ManuallyDrop bypasses `Drop for AnyTaskJob`
+        // (its `poll.unref` reads the discovering thread's js_vm_ctx TLS) and
+        // the ctx field drop glue — the ctx is consumed by its own dispose.
+        let job = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
+        // SAFETY: each field is read out exactly once from the suppressed value.
+        unsafe {
+            C::dispose_for_dead_vm(core::ptr::read(&raw const job.ctx));
+            drop(core::ptr::read(&raw const job.vm));
+        }
+    }
+}
 
 impl<C> Drop for AnyTaskJob<C> {
     #[inline]
@@ -93,10 +113,11 @@ impl<C: AnyTaskJobCtx> AnyTaskJob<C> {
         // SAFETY: `job` was just allocated and is exclusively owned here.
         // Build the erased AnyTask directly with a non-capturing shim.
         unsafe {
-            (*job).any_task = AnyTask {
-                ctx: NonNull::new(job.cast::<c_void>()),
-                callback: |p: *mut c_void| Self::run_from_js(p.cast::<Self>()).map_err(Into::into),
-            };
+            (*job).any_task = AnyTask::from_typed_with_dispose(
+                job,
+                Self::run_from_js_erased,
+                <Self as crate::vm_handle::DisposeAfterVmDestroyed>::dispose_after_vm_destroyed,
+            );
         }
         // `ctx.init` may throw (e.g. CryptoJob<Scrypt>); on error, reclaim the
         // box so `Drop for C` releases any resources `ctx` already owns.
@@ -148,11 +169,20 @@ impl<C: AnyTaskJobCtx> AnyTaskJob<C> {
         job.ctx.run(job.global);
         // On success, `ConcurrentTask::create` heap-allocates a fresh task and
         // the queue takes ownership; on `false` (worker VM destroyed) the job
-        // is parked per the `VMHandle::enqueue_task_concurrent` policy.
+        // is freed here.
         let any_task = job.any_task.task();
         if !vm.enqueue_task_concurrent(|| ConcurrentTask::create(any_task)) {
-            crate::vm_handle::park_leak(core::ptr::from_mut(job).cast());
+            // SAFETY: sole owner — the queue never took the job.
+            unsafe {
+                <Self as crate::vm_handle::DisposeAfterVmDestroyed>::dispose_after_vm_destroyed(
+                    core::ptr::from_mut(job),
+                );
+            }
         }
+    }
+
+    fn run_from_js_erased(this: *mut Self) -> bun_event_loop::AnyTask::JsResult<()> {
+        Self::run_from_js(this).map_err(Into::into)
     }
 
     /// `AnyTask` callback — runs ON the JS thread. Reclaims the heap

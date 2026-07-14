@@ -363,6 +363,7 @@ impl UploadPart {
             },
             s3_simple_request::S3Callback::Part(Self::on_part_response),
             callback_context,
+            crate::webcore::s3::simple_request::noop_context_dispose,
         )
     }
 
@@ -449,6 +450,7 @@ impl MultiPartUpload {
                         },
                         s3_simple_request::S3Callback::Upload(Self::single_send_upload_response),
                         callback_context,
+                        crate::webcore::s3::simple_request::noop_context_dispose,
                     )?;
 
                     Ok(())
@@ -831,6 +833,7 @@ impl MultiPartUpload {
             },
             s3_simple_request::S3Callback::Commit(Self::on_commit_multi_part_request),
             callback_context,
+            crate::webcore::s3::simple_request::noop_context_dispose,
         )
     }
 
@@ -862,6 +865,7 @@ impl MultiPartUpload {
             },
             s3_simple_request::S3Callback::Upload(Self::on_rollback_multi_part_request),
             callback_context,
+            crate::webcore::s3::simple_request::noop_context_dispose,
         )
     }
 
@@ -898,6 +902,7 @@ impl MultiPartUpload {
                 },
                 s3_simple_request::S3Callback::Download(Self::start_multi_part_request_result),
                 callback_context,
+                crate::webcore::s3::simple_request::noop_context_dispose,
             )?;
         } else if self.state == State::MultipartCompleted {
             // SAFETY: part points into self.queue which is live; reborrow disjoint from self fields used above
@@ -1040,6 +1045,7 @@ impl MultiPartUpload {
                 },
                 s3_simple_request::S3Callback::Upload(Self::single_send_upload_response),
                 callback_context,
+                crate::webcore::s3::simple_request::noop_context_dispose,
             ); // TODO: properly propagate exception upwards
         } else {
             // we need to split

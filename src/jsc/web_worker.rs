@@ -1249,11 +1249,6 @@ impl WebWorker {
             // clear it so process.on('exit') handlers can run. teardownJSCVM
             // re-sets it for the JSC VM teardown.
             vm.jsc_vm().clear_has_termination_request();
-            // Close the cross-thread VMHandle gate BEFORE publishing
-            // `is_shutting_down`: HTTP/pool guests then see either a live,
-            // non-shutting-down VM or a closed gate — never the
-            // shutting-down state that main-exit parking paths key on.
-            vm.close_cross_thread_gate();
             vm.is_shutting_down = true;
             vm.on_exit();
             if let Some(hooks) = runtime_hooks() {
@@ -1289,6 +1284,17 @@ impl WebWorker {
             // ~JSEventListener Weak<> handles, and after teardownJSCVM the
             // worker VM is dealloc'd-without-Drop so anything still in
             // self.tasks leaks. Mirrors the global_exit() ordering.
+            if let Some(hooks) = runtime_hooks() {
+                // Detach in-flight fetches while JSC is alive (aborts the
+                // transfers and releases their JSC handles on this thread);
+                // must precede the gate close so the HTTP thread's last deref
+                // only ever frees process-heap state.
+                // SAFETY: sole owner (unpublished above); JS thread, pre-teardown.
+                unsafe { (hooks.detach_fetch_tasklets)(vm_ptr) };
+            }
+            // Close the cross-thread VMHandle gate: producers that lose the
+            // race dispose their completion objects themselves from here on.
+            vm.close_cross_thread_gate();
             vm.event_loop_mut().release_queued_tasks_for_shutdown();
             exit_code = i32::from(vm.exit_handler.exit_code);
             global_object = Some(vm.global);

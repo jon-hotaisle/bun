@@ -581,6 +581,13 @@ impl S3BlobStatTask {
         Ok(())
     }
 
+    /// # Safety
+    /// Dead-VM path only: caller owns `ptr` exclusively and the owning VM
+    /// (and thus `promise`/`global`'s slot storage) is gone.
+    unsafe fn dispose_for_dead_vm(ptr: *mut core::ffi::c_void) {
+        crate::s3_dispose_promise_store_ctx!(Self, ptr);
+    }
+
     pub(crate) fn exists(global: &JSGlobalObject, blob: &Blob) -> JsResult<JSValue> {
         let this = S3BlobStatTask::new(S3BlobStatTask {
             promise: bun_jsc::JSPromiseStrong::init(global),
@@ -602,6 +609,7 @@ impl S3BlobStatTask {
             path,
             S3BlobStatTask::on_s3_exists_resolved,
             this.cast::<core::ffi::c_void>(),
+            S3BlobStatTask::dispose_for_dead_vm,
             env.get_http_proxy(true, None, None).map(|proxy| proxy.href),
             s3_store.request_payer,
         )?;
@@ -629,6 +637,7 @@ impl S3BlobStatTask {
             path,
             S3BlobStatTask::on_s3_stat_resolved,
             this.cast::<core::ffi::c_void>(),
+            S3BlobStatTask::dispose_for_dead_vm,
             env.get_http_proxy(true, None, None).map(|proxy| proxy.href),
             s3_store.request_payer,
         )?;
@@ -656,6 +665,7 @@ impl S3BlobStatTask {
             path,
             S3BlobStatTask::on_s3_size_resolved,
             this.cast::<core::ffi::c_void>(),
+            S3BlobStatTask::dispose_for_dead_vm,
             env.get_http_proxy(true, None, None).map(|proxy| proxy.href),
             s3_store.request_payer,
         )?;

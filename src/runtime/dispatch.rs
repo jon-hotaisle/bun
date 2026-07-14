@@ -1206,6 +1206,19 @@ pub(crate) fn __bun_release_task_at_shutdown(task: bun_event_loop::Task) -> bool
             for_each_fs_async_op!(__fs_destroy);
             true
         }
+        // A queued non-final chunk left `has_schedule_callback` set; the
+        // dispose unsticks it and aborts (mid-stream) or frees (final) — see
+        // `S3HttpDownloadStreamingTask::dispose_after_vm_destroyed`.
+        task_tag::S3HttpDownloadStreamingTask => {
+            // SAFETY: the tag identifies the pointee; the queue owned this
+            // entry and the drain popped it.
+            unsafe {
+                <S3HttpDownloadStreamingTask as bun_jsc::vm_handle::DisposeAfterVmDestroyed>::dispose_after_vm_destroyed(
+                    task.ptr.cast(),
+                );
+            }
+            true
+        }
         // Same reclaim `drop_concurrent_cpp_tasks` performs, but for tasks
         // that were already batch-moved into `self.tasks`. Must run before
         // JSC teardown: a Worker `dispatchExit` lambda's `~Ref<Worker>` walks
@@ -1224,6 +1237,68 @@ pub(crate) fn __bun_release_task_at_shutdown(task: bun_event_loop::Task) -> bool
         // static-rooted VM. Dispatching the type-erased `AnyTask` callback
         // is not generally safe at shutdown (e.g. `AsyncModule::on_done`,
         // `dns::Holder::run` call straight into JS).
+        _ => false,
+    }
+}
+
+/// `__bun_dispose_task_after_vm_destroyed` body — declared `extern "Rust"`
+/// in `bun_jsc::event_loop`. Called from `EventLoop::deinit` for tasks still
+/// queued when a worker VM is torn down: frees each per the
+/// [`bun_jsc::vm_handle::DisposeAfterVmDestroyed`] contract (the VM's JSC
+/// heap and HandleSet are gone — handle slots are forgotten, everything else
+/// is freed). Unclaimed tags return `false` and are dropped from the queue
+/// without freeing their box (owned elsewhere).
+#[unsafe(no_mangle)]
+pub(crate) fn __bun_dispose_task_after_vm_destroyed(task: bun_event_loop::Task) -> bool {
+    use bun_event_loop::task_tag;
+    use bun_jsc::vm_handle::DisposeAfterVmDestroyed as Dispose;
+    macro_rules! dispose_arm {
+        ($ty:ty) => {{
+            // SAFETY: the tag identifies the pointee; the queue owned this
+            // entry and the caller popped it — sole owner here.
+            unsafe { <$ty as Dispose>::dispose_after_vm_destroyed(task.ptr.cast()) };
+            true
+        }};
+    }
+    match task.tag {
+        // A queued progress update owns one JS-side ref; the final release
+        // routes through `dealloc_for_shutdown`'s worker branch.
+        task_tag::FetchTasklet => {
+            FetchTasklet::deref(task.ptr.cast::<FetchTasklet>());
+            true
+        }
+        task_tag::AsyncGlobWalkTask => dispose_arm!(AsyncGlobWalkTask<'_>),
+        task_tag::AsyncImageTask => dispose_arm!(AsyncImageTask<'_>),
+        task_tag::AsyncTransformTask => dispose_arm!(AsyncTransformTask<'_>),
+        task_tag::CopyFilePromiseTask => dispose_arm!(CopyFilePromiseTask<'_>),
+        task_tag::ReadFileTask => dispose_arm!(ReadFileTask),
+        task_tag::WriteFileTask => dispose_arm!(WriteFileTask),
+        #[cfg(not(windows))]
+        task_tag::GetAddrInfoRequestTask => dispose_arm!(get_addr_info_request::Task),
+        task_tag::ArchiveExtractTask => dispose_arm!(ArchiveExtractTask),
+        task_tag::ArchiveBlobTask => dispose_arm!(ArchiveBlobTask),
+        task_tag::ArchiveWriteTask => dispose_arm!(ArchiveWriteTask),
+        task_tag::ArchiveFilesTask => dispose_arm!(ArchiveFilesTask),
+        task_tag::NativeZlib => dispose_arm!(NativeZlib),
+        task_tag::NativeBrotli => dispose_arm!(NativeBrotli),
+        task_tag::NativeZstd => dispose_arm!(NativeZstd),
+        task_tag::S3HttpSimpleTask => dispose_arm!(S3HttpSimpleTask),
+        task_tag::S3HttpDownloadStreamingTask => dispose_arm!(S3HttpDownloadStreamingTask),
+        task_tag::NapiAsyncWork => dispose_arm!(napi_async_work),
+        // POSIX only: on Windows these tags are `UVFSRequest`s whose
+        // completions run on the worker's own uv loop (same thread).
+        #[cfg(not(windows))]
+        for_each_fs_async_op!(__fs_pat) => {
+            macro_rules! __fs_dispose {
+                ($($tag:ident $ty:ident;)*) => { match task.tag {
+                    $(task_tag::$tag => { dispose_arm!(fs_async::$ty); })*
+                    // SAFETY: outer arm guard proves one of the table tags matched.
+                    _ => unsafe { core::hint::unreachable_unchecked() },
+                }};
+            }
+            for_each_fs_async_op!(__fs_dispose);
+            true
+        }
         _ => false,
     }
 }

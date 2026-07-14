@@ -328,6 +328,10 @@ impl StatWatcherScheduler {
         // `addr_of_mut!` so the field pointer inherits whole-Box provenance.
         unsafe {
             (*holder_ptr).task = AnyTask {
+                // Queue-owned box, deliberately not freed at teardown: the
+                // scheduler RefPtr it carries cannot be released post-teardown.
+                // Known leak at worker terminate with an update hop in flight.
+                dispose: None,
                 ctx: core::ptr::NonNull::new(holder_ptr.cast()),
                 callback: update_timer,
             };

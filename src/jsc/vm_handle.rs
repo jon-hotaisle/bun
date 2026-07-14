@@ -52,11 +52,10 @@ impl VMHandle {
 
     /// Enqueue a concurrent task on the VM's JS-thread event loop. Returns
     /// `false` if the VM is already torn down — `make_task` then never runs
-    /// and the caller must dispose whatever it would have wrapped; when the
-    /// task cannot be disposed off the JS thread (it owns JSC `Strong`/`Weak`
-    /// handles), the caller leaks it — the dead VM's JSC heap was already
-    /// torn down wholesale, and the leak is bounded by the jobs in flight at
-    /// terminate. On success the queue takes ownership of the produced
+    /// and the caller must free whatever it would have wrapped via its
+    /// [`DisposeAfterVmDestroyed`] path (JSC handle fields are forgotten —
+    /// their slot storage died with the VM — everything else is dropped).
+    /// On success the queue takes ownership of the produced
     /// `ConcurrentTask` via its intrusive `next` link. Enqueueing into a live
     /// but shutting-down VM still succeeds — worker teardown drains the queue
     /// after closing the gate; on the main VM the queue outlives the process.
@@ -72,8 +71,13 @@ impl VMHandle {
 
     /// [`Self::enqueue_task_concurrent`] for the common shape where the task
     /// is `owner`'s inline intrusive `concurrent_task` field: on `false` the
-    /// field is left untouched and `owner` is parked via [`park_leak`].
-    pub fn enqueue_intrusive<T: bun_event_loop::Taskable>(
+    /// field is left untouched and `owner` is freed via
+    /// [`DisposeAfterVmDestroyed`].
+    ///
+    /// `owner` must be live and exclusively owned by the caller (the same
+    /// contract every producer already upholds for the enqueue itself).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn enqueue_intrusive<T: bun_event_loop::Taskable + DisposeAfterVmDestroyed>(
         &self,
         ct: &mut crate::event_loop::ConcurrentTaskItem,
         owner: *mut T,
@@ -82,9 +86,21 @@ impl VMHandle {
         let queued = self
             .enqueue_task_concurrent(|| NonNull::from(ct.from(owner, AutoDeinit::ManualDeinit)));
         if !queued {
-            park_leak(owner.cast());
+            // SAFETY: `false` ⇒ the queue never took ownership; the completing
+            // thread is the sole owner of `owner`, and the owning VM is gone.
+            unsafe { T::dispose_after_vm_destroyed(owner) };
         }
         queued
+    }
+
+    /// Pin the VM allocation (and everything owned by its worker thread's
+    /// shutdown, e.g. the env loader) for a bounded external operation such
+    /// as a bundle run. `None` if the VM is gone. Worker terminate blocks
+    /// until the returned guard drops, so only bounded work may hold one; the
+    /// guard owns its own `Arc` and may outlive `self`.
+    #[must_use]
+    pub fn pin_for_bounded_work(&self) -> Option<bun_threading::GateGuest> {
+        bun_threading::GateGuest::enter(&self.gate)
     }
 
     /// The VM, without the gate. Only callable on the VM's own JS thread,
@@ -101,17 +117,24 @@ impl VMHandle {
     }
 }
 
-/// Intentional-leak registry for completion objects whose owning worker VM
-/// was destroyed (the `enqueue_task_concurrent == false` policy): their JSC
-/// handles cannot be dropped off the JS thread, so the box is never freed.
-/// Parking the address here keeps the allocation reachable, so LeakSanitizer
-/// reports stay actionable instead of flagging every deliberate leak. Never
-/// drained; bounded by jobs in flight at worker terminate.
-static PARKED_LEAKS: bun_threading::Guarded<alloc::vec::Vec<usize>> =
-    bun_threading::Guarded::new(alloc::vec::Vec::new());
-
-extern crate alloc;
-
-pub fn park_leak(ptr: *mut core::ffi::c_void) {
-    PARKED_LEAKS.lock().push(ptr as usize);
+/// Free a completion object whose owning VM has been destroyed.
+///
+/// The destroyed VM's JSC heap, HandleSet and WeakBlocks are already freed
+/// wholesale, so JSC handle wrappers (`Strong`, `StrongOptional`,
+/// `JSPromiseStrong`, `Weak`) are plain pointers into dead memory:
+/// `core::mem::forget(core::mem::take(&mut field))` releases them without a
+/// byte of leak — the slot storage was owned by (and died with) the VM.
+/// Everything else the object owns (boxes, buffers, fds, process-heap
+/// natives whose destructors don't touch the JSC heap) must be freed
+/// normally. Runs on whatever thread discovered the dead VM (work pool,
+/// HTTP thread); implementations must not touch the VM, its loop, or any
+/// thread-local of the dead thread.
+///
+/// # Safety
+/// Implementations free `this`; callers must own it exclusively.
+pub unsafe trait DisposeAfterVmDestroyed {
+    /// # Safety
+    /// `this` is live, exclusively owned by the caller, and its owning VM has
+    /// been destroyed (its gate is closed).
+    unsafe fn dispose_after_vm_destroyed(this: *mut Self);
 }

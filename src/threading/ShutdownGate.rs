@@ -65,6 +65,28 @@ impl ShutdownGate {
     }
 }
 
+/// RAII guest of a [`ShutdownGate`]: holds the gate open (via its own `Arc`,
+/// so it may outlive whatever produced it) until dropped.
+pub struct GateGuest {
+    gate: std::sync::Arc<ShutdownGate>,
+}
+
+impl GateGuest {
+    /// Enter `gate`; `None` if it is already closed.
+    #[must_use]
+    pub fn enter(gate: &std::sync::Arc<ShutdownGate>) -> Option<Self> {
+        gate.enter().then(|| Self {
+            gate: std::sync::Arc::clone(gate),
+        })
+    }
+}
+
+impl Drop for GateGuest {
+    fn drop(&mut self) {
+        self.gate.leave();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,14 +114,40 @@ mod tests {
                     })
                 })
                 .collect();
+            // A second concurrent closer: close_and_wait must be callable
+            // from several owners and both must drain.
+            let second_closer = {
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || gate.close_and_wait())
+            };
             gate.close_and_wait();
             // After close_and_wait returns, no guest is inside and none can enter.
             assert_eq!(inside.load(Ordering::SeqCst), 0);
             assert!(!gate.enter());
             gate.close_and_wait(); // idempotent
+            second_closer.join().unwrap();
             for g in guests {
                 g.join().unwrap();
             }
         }
+    }
+
+    #[test]
+    fn enter_is_rejected_while_a_guest_holds_the_gate_closed() {
+        let gate = Arc::new(ShutdownGate::new());
+        assert!(gate.enter());
+        let closer = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || gate.close_and_wait())
+        };
+        // The closer sets CLOSED immediately; wait until new entries bounce.
+        while gate.enter() {
+            gate.leave();
+            std::hint::spin_loop();
+        }
+        // Release the in-flight guest so the blocked closer drains.
+        gate.leave();
+        closer.join().unwrap();
+        assert!(!gate.enter());
     }
 }

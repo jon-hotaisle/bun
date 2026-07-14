@@ -2880,6 +2880,17 @@ pub mod JSZstd {
     }
 
     impl jsc::AnyTaskJobCtx for ZstdCtx {
+        unsafe fn dispose_for_dead_vm(self) {
+            // SAFETY: sole owner. Skip the input's unprotect (dead heap) but
+            // drop its owned bytes and the output; forget the promise slot.
+            let ctx = core::mem::ManuallyDrop::new(self);
+            // SAFETY: fields are read out of the suppressed value exactly once.
+            unsafe {
+                drop(core::ptr::read(&raw const ctx.buffer).into_inner_for_dead_vm());
+                drop(core::ptr::read(&raw const ctx.output));
+            }
+        }
+
         fn run(&mut self, _global: *mut JSGlobalObject) {
             let input = self.buffer.slice();
 

@@ -108,6 +108,25 @@ pub enum S3PartResult<'a> {
     Failure(S3Error<'a>),
 }
 
+/// Dead-VM dispose for the common S3 callback ctx shape `{ promise, store, .. }`:
+/// forget the promise slot (died with the VM's HandleSet), deref the
+/// thread-safe `StoreRef`, forget the rest.
+#[macro_export]
+macro_rules! s3_dispose_promise_store_ctx {
+    ($ty:ty, $ptr:expr) => {{
+        let ptr: *mut ::core::ffi::c_void = $ptr;
+        // SAFETY: same heap ctx the callback would have consumed; sole owner.
+        #[allow(unused_unsafe)]
+        let this = ::core::mem::ManuallyDrop::new(*unsafe {
+            ::bun_core::heap::take(ptr.cast::<$ty>())
+        });
+        // SAFETY: `store` is read out exactly once.
+        #[allow(unused_unsafe)]
+        // SAFETY: single read of the suppressed value.
+        drop(unsafe { ::core::ptr::read(&raw const this.store) });
+    }};
+}
+
 pub struct S3HttpSimpleTask {
     // `http` is `MaybeUninit` because (a) it is initialised late —
     // `AsyncHTTP` contains `&'static [u8]` and `fn(...)` fields, so a
@@ -124,6 +143,9 @@ pub struct S3HttpSimpleTask {
     pub sign_result: SignResult,
     pub headers: Headers,
     pub callback_context: *mut c_void,
+    /// Frees `callback_context` when the owning VM died before `on_response`
+    /// could run (see `DisposeAfterVmDestroyed` impl below).
+    pub callback_context_dispose: unsafe fn(*mut c_void),
     pub callback: Callback,
     pub response_buffer: MutableString,
     // `'static` here because `result.body` (when set) points at our own
@@ -160,6 +182,7 @@ impl Default for S3HttpSimpleTask {
             sign_result: SignResult::default(),
             headers: Headers::default(),
             callback_context: core::ptr::null_mut(),
+            callback_context_dispose: noop_context_dispose,
             callback: Callback::Upload(unset_callback),
             response_buffer: MutableString::default(),
             result: HTTPClientResult::default(),
@@ -174,6 +197,12 @@ impl Default for S3HttpSimpleTask {
 
 // Re-export the canonical alias so sibling modules that imported it from here keep compiling.
 pub use bun_jsc::JsTerminatedResult;
+
+/// Dispose for callback contexts that own nothing the task must free
+/// (e.g. independently-refcounted `MultiPartUpload`).
+/// Dead-VM dispose for callback ctxs owned elsewhere (independently
+/// refcounted JS-thread objects): nothing to free from the HTTP thread.
+pub(crate) unsafe fn noop_context_dispose(_: *mut c_void) {}
 
 pub enum Callback {
     Stat(fn(S3StatResult<'_>, *mut c_void) -> JsTerminatedResult<()>),
@@ -478,10 +507,40 @@ impl S3HttpSimpleTask {
             // to avoid a stacked-borrows / aliasing diagnostic on `*this`.
             let this_ptr = std::ptr::from_mut::<Self>(this);
             let vm = this.vm.clone().expect("vm set at task creation");
-            // On `false` (worker VM destroyed) the task box is leaked per the
-            // `VMHandle::enqueue_task_concurrent` policy; the transfer is
-            // already complete (`is_done`), so no socket is held.
+            // On `false` (worker VM destroyed) `enqueue_intrusive` frees the
+            // task via `DisposeAfterVmDestroyed`; the transfer is already
+            // complete (`is_done`), so no socket is held.
             let _ = vm.enqueue_intrusive(&mut this.concurrent_task, this_ptr);
+        }
+    }
+}
+
+// SAFETY: frees `this` exactly once per the trait contract. Runs on the HTTP
+// thread when `enqueue_intrusive` finds the owning worker VM destroyed.
+unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for S3HttpSimpleTask {
+    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
+        // SAFETY: caller owns `this` exclusively; `ManuallyDrop` suppresses
+        // `Drop` (its `poll_ref.unref` would touch the dead VM's loop).
+        let mut task = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
+        // SAFETY: fields are read out of the suppressed value exactly once.
+        unsafe {
+            (task.callback_context_dispose)(task.callback_context);
+            // Mirror `Drop`'s http cleanup (transfer is done, so the HTTP
+            // thread no longer aliases these buffers).
+            let http = task.http.assume_init_mut();
+            http.clear_data();
+            http.request_headers = Default::default();
+            http.client.header_entries = Default::default();
+            // Owned process-heap fields; `poll_ref` (no Drop) and the fn
+            // pointers are forgotten with the rest.
+            drop(core::ptr::read(&raw const task.result));
+            drop(core::ptr::read(&raw const task.sign_result));
+            drop(core::ptr::read(&raw const task.headers));
+            drop(core::ptr::read(&raw const task.response_buffer));
+            drop(core::ptr::read(&raw const task.range));
+            drop(core::ptr::read(&raw const task.proxy_url));
+            drop(core::ptr::read(&raw const task.body));
+            drop(core::ptr::read(&raw const task.vm));
         }
     }
 }
@@ -562,6 +621,7 @@ pub(crate) fn execute_simple_s3_request(
     options: S3SimpleRequestOptions<'_>,
     callback: Callback,
     callback_context: *mut c_void,
+    callback_context_dispose: unsafe fn(*mut c_void),
 ) -> JsTerminatedResult<()> {
     let result = match this.sign_request::<false>(
         &SignOptions {
@@ -618,6 +678,7 @@ pub(crate) fn execute_simple_s3_request(
         http: core::mem::MaybeUninit::uninit(),
         sign_result: result,
         callback_context,
+        callback_context_dispose,
         callback,
         range: options.range,
         headers,

@@ -18,6 +18,10 @@ pub type JsResult<T> = core::result::Result<T, ErasedJsError>;
 pub struct AnyTask {
     pub ctx: Option<NonNull<c_void>>,
     pub callback: fn(*mut c_void) -> JsResult<()>,
+    /// Frees `ctx` when the owning worker VM is torn down before the task
+    /// could run (worker terminate). `None` ⇒ the ctx is owned elsewhere and
+    /// must not be freed from the queue.
+    pub dispose: Option<unsafe fn(*mut c_void)>,
 }
 
 impl Default for AnyTask {
@@ -27,6 +31,7 @@ impl Default for AnyTask {
         Self {
             ctx: None,
             callback: |_| unreachable!("AnyTask.callback was undefined"),
+            dispose: None,
         }
     }
 }
@@ -64,6 +69,22 @@ impl AnyTask {
                     callback,
                 )
             },
+            dispose: None,
         }
+    }
+
+    /// [`Self::from_typed`] plus a dead-VM dispose for `ctx` (see the
+    /// `dispose` field).
+    #[inline]
+    pub fn from_typed_with_dispose<T>(
+        ctx: *mut T,
+        callback: fn(*mut T) -> JsResult<()>,
+        dispose: unsafe fn(*mut T),
+    ) -> Self {
+        let mut task = Self::from_typed(ctx, callback);
+        // SAFETY: same ABI argument as `from_typed`'s callback transmute.
+        task.dispose =
+            Some(unsafe { core::mem::transmute::<unsafe fn(*mut T), unsafe fn(*mut c_void)>(dispose) });
+        task
     }
 }

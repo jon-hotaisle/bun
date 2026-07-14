@@ -66,6 +66,7 @@ pub(crate) fn stat(
     path: &[u8],
     callback: fn(S3StatResult, *mut c_void) -> JsTerminatedResult<()>,
     callback_context: *mut c_void,
+    context_dispose: unsafe fn(*mut c_void),
     proxy_url: Option<&[u8]>,
     request_payer: bool,
 ) -> JsTerminatedResult<()> {
@@ -81,6 +82,7 @@ pub(crate) fn stat(
         },
         s3_simple_request::Callback::Stat(callback),
         callback_context,
+        context_dispose,
     )
 }
 
@@ -89,6 +91,7 @@ pub(crate) fn download(
     path: &[u8],
     callback: fn(S3DownloadResult, *mut c_void) -> JsTerminatedResult<()>,
     callback_context: *mut c_void,
+    context_dispose: unsafe fn(*mut c_void),
     proxy_url: Option<&[u8]>,
     request_payer: bool,
 ) -> JsTerminatedResult<()> {
@@ -104,6 +107,7 @@ pub(crate) fn download(
         },
         s3_simple_request::Callback::Download(callback),
         callback_context,
+        context_dispose,
     )
 }
 
@@ -114,6 +118,7 @@ pub(crate) fn download_slice(
     size: Option<usize>,
     callback: fn(S3DownloadResult, *mut c_void) -> JsTerminatedResult<()>,
     callback_context: *mut c_void,
+    context_dispose: unsafe fn(*mut c_void),
     proxy_url: Option<&[u8]>,
     request_payer: bool,
 ) -> JsTerminatedResult<()> {
@@ -148,6 +153,7 @@ pub(crate) fn download_slice(
         },
         s3_simple_request::Callback::Download(callback),
         callback_context,
+        context_dispose,
     )
 }
 
@@ -156,6 +162,7 @@ pub(crate) fn delete(
     path: &[u8],
     callback: fn(S3DeleteResult, *mut c_void) -> JsTerminatedResult<()>,
     callback_context: *mut c_void,
+    context_dispose: unsafe fn(*mut c_void),
     proxy_url: Option<&[u8]>,
     request_payer: bool,
 ) -> JsTerminatedResult<()> {
@@ -171,6 +178,7 @@ pub(crate) fn delete(
         },
         s3_simple_request::Callback::Delete(callback),
         callback_context,
+        context_dispose,
     )
 }
 
@@ -183,6 +191,7 @@ pub(crate) fn list_objects(
     list_options: &S3ListObjectsOptions,
     callback: fn(S3ListObjectsResult, *mut c_void) -> JsTerminatedResult<()>,
     callback_context: *mut c_void,
+    context_dispose: unsafe fn(*mut c_void),
     proxy_url: Option<&[u8]>,
 ) -> JsTerminatedResult<()> {
     let mut search_params: Vec<u8> = Vec::<u8>::default();
@@ -301,6 +310,7 @@ pub(crate) fn list_objects(
         range: None,
         sign_result: result,
         callback_context,
+        callback_context_dispose: context_dispose,
         callback: s3_simple_request::Callback::ListObjects(callback),
         headers,
         vm: Some(VirtualMachine::get().cross_thread_handle()),
@@ -388,6 +398,7 @@ pub fn upload(
     request_payer: bool,
     callback: fn(S3UploadResult, *mut c_void) -> JsTerminatedResult<()>,
     callback_context: *mut c_void,
+    context_dispose: unsafe fn(*mut c_void),
 ) -> JsTerminatedResult<()> {
     s3_simple_request::execute_simple_s3_request(
         this,
@@ -406,6 +417,7 @@ pub fn upload(
         },
         s3_simple_request::Callback::Upload(callback),
         callback_context,
+        context_dispose,
     )
 }
 
@@ -921,6 +933,7 @@ pub(crate) fn download_stream(
         ctx: *mut c_void,
     ),
     callback_context: *mut c_void,
+    context_dispose: unsafe fn(*mut c_void),
 ) -> *mut S3HttpDownloadStreamingTask {
     let range: Option<Vec<u8>> = 'brk: {
         if let Some(size_) = size {
@@ -1000,6 +1013,7 @@ pub(crate) fn download_stream(
             proxy_url: owned_proxy,
             callback_context: NonNull::new(callback_context.cast::<()>())
                 .expect("callers always pass a non-null Box-allocated context"),
+            callback_context_dispose: context_dispose,
             callback,
             range: range.map(Vec::into_boxed_slice),
             headers,
@@ -1215,6 +1229,20 @@ pub fn readable_stream(
             let self_: &mut Self = unsafe { bun_ptr::callback_ctx::<Self>(opaque_self) };
             let _ = Self::callback(chunk, has_more, err, self_); // TODO: properly propagate exception upwards
         }
+
+        /// # Safety
+        /// Dead-VM path only: caller owns `ptr` exclusively and the owning VM
+        /// (and thus `readable_stream_ref`'s slot storage) is gone.
+        unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
+            // `Drop` must not run: `clear_stream_cancel_handler` touches the
+            // dead stream. `readable_stream_ref` died with the VM's HandleSet;
+            // `global`/`task` are non-owning; only `path` is owned heap.
+            let this =
+                // SAFETY: same heap ctx `run`/the callback would have consumed; sole owner.
+                core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(ptr.cast::<Self>()) });
+            // SAFETY: fields are read out of the suppressed value exactly once.
+            drop(unsafe { core::ptr::read(&raw const this.path) });
+        }
     }
 
     impl Drop for S3DownloadStreamWrapper {
@@ -1270,6 +1298,7 @@ pub fn readable_stream(
         request_payer,
         S3DownloadStreamWrapper::opaque_callback,
         wrapper.cast::<c_void>(),
+        S3DownloadStreamWrapper::dispose_for_dead_vm,
     );
     if !task.is_null() {
         // SAFETY: on the success path `download_stream` only schedules work onto the HTTP

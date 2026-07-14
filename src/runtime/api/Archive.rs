@@ -694,6 +694,19 @@ impl<C: TaskContext> Taskable for AsyncTask<C> {
     const TAG: TaskTag = C::TAG;
 }
 
+// SAFETY: frees `this` exactly once per the trait contract.
+unsafe impl<C: TaskContext> bun_jsc::vm_handle::DisposeAfterVmDestroyed for AsyncTask<C> {
+    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
+        // SAFETY: caller owns `this` exclusively (enqueue never happened).
+        let mut boxed = unsafe { bun_core::heap::take(this) };
+        // The promise's handle slot died with the VM's HandleSet. Every ctx
+        // variant owns only process-heap data (StoreRef derefs are JSC-free);
+        // KeepAlive has no Drop and the dead loop must not be unref'd.
+        let _ = core::mem::ManuallyDrop::new(core::mem::take(&mut boxed.promise));
+        drop(boxed);
+    }
+}
+
 impl<C: TaskContext> AsyncTask<C> {
     fn create(global: &JSGlobalObject, ctx: C) -> Result<*mut Self, bun_alloc::AllocError> {
         let this = Box::new(AsyncTask {

@@ -200,6 +200,7 @@ unsafe extern "Rust" {
     /// own JSC handles or whose callback isn't safe to no-op-dispatch).
     /// Defined in `bun_runtime::dispatch`. Link-time resolved.
     fn __bun_release_task_at_shutdown(task: bun_event_loop::Task) -> bool;
+    fn __bun_dispose_task_after_vm_destroyed(task: bun_event_loop::Task) -> bool;
 }
 
 #[inline]
@@ -770,16 +771,13 @@ impl EventLoop {
 
     pub fn deinit(&mut self) {
         // Free (don't run — running could re-enter the dying VM) queued
-        // ManagedTask boxes. Other tags can't be freed here: their callback
-        // can't be no-op-dispatched safely (`AnyTask` callbacks call into JS)
-        // and their box may be aliased by the originator — park them in the
-        // intentional-leak registry so the leak stays reachable to LSan even
-        // after a worker VM's box (and this queue's buffers) is raw-dealloc'd.
-        // CppTasks must NOT be deleted here: this runs after JSC VM teardown
-        // on both worker and main paths, and a Worker dispatchExit task's
-        // `~Ref<Worker>` would walk freed WeakBlock storage via
-        // `~JSEventListener`. They are reclaimed before teardown by
-        // `release_queued_tasks_for_shutdown`'s CppTask arm.
+        // ManagedTask boxes, and dispose `AnyTask`s that carry a dead-VM
+        // dispose. Remaining tags are handed to the per-tag
+        // `__bun_dispose_task_after_vm_destroyed` hook in
+        // `bun_runtime::dispatch`; tags it doesn't claim are dropped from the
+        // queue without freeing their box (owned elsewhere — e.g. CppTasks,
+        // whose `~Ref<Worker>` would walk freed WeakBlock storage; they are
+        // reclaimed before teardown by `release_queued_tasks_for_shutdown`).
         while let Some(task) = self.tasks.read_item() {
             if task.tag == bun_event_loop::task_tag::ManagedTask {
                 // SAFETY: every ManagedTask is heap_owned (ManagedTask::new -> heap::into_raw).
@@ -789,8 +787,24 @@ impl EventLoop {
                     cleanup(ctx.as_ptr());
                 }
                 drop(managed);
+            } else if task.tag == bun_event_loop::task_tag::AnyTask {
+                // Copy the fields out first: `dispose` may free the
+                // allocation the `AnyTask` itself is embedded in.
+                // SAFETY: an AnyTask-tagged `ptr` is the `*mut AnyTask` that
+                // `AnyTask::task()` registered; still live (queue-owned).
+                let (dispose, ctx) = unsafe {
+                    let any = &*task.ptr.cast::<bun_event_loop::AnyTask::AnyTask>();
+                    (any.dispose, any.ctx)
+                };
+                if let (Some(dispose), Some(ctx)) = (dispose, ctx) {
+                    // SAFETY: dispose contract — the owning VM is being torn
+                    // down and the queue owns `ctx`.
+                    unsafe { dispose(ctx.as_ptr()) };
+                }
             } else {
-                crate::vm_handle::park_leak(task.ptr.cast());
+                // SAFETY: tag-specific dead-VM dispose; definer in
+                // `bun_runtime::dispatch`. `false` ⇒ not claimed (dropped).
+                let _ = unsafe { __bun_dispose_task_after_vm_destroyed(task) };
             }
         }
         // Reassigning a fresh value drops the old buffers in place.

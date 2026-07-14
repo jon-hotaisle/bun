@@ -370,6 +370,13 @@ impl S3Ext for S3 {
                 }
                 Ok(())
             }
+
+            /// # Safety
+            /// Dead-VM path only: caller owns `ptr` exclusively and the owning
+            /// VM (and `promise`'s slot storage) is gone.
+            unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
+                crate::s3_dispose_promise_store_ctx!(Wrapper, ptr);
+            }
         }
 
         // Wrapper.deinit body deleted — store.deref() handled by StoreRef::drop,
@@ -402,6 +409,7 @@ impl S3Ext for S3 {
                 global: bun_ptr::BackRef::new(global_this),
             }))
             .cast::<c_void>(),
+            Wrapper::dispose_for_dead_vm,
             proxy,
             aws_options.request_payer,
         )?;
@@ -465,6 +473,22 @@ impl S3Ext for S3 {
                 }
                 Ok(())
             }
+
+            /// # Safety
+            /// Dead-VM path only: caller owns `ptr` exclusively and the owning
+            /// VM (and `promise`'s slot storage) is gone.
+            unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
+                // Also frees the owned list options (process heap).
+                // SAFETY: same heap ctx the callback would have consumed; sole owner.
+                let this = core::mem::ManuallyDrop::new(*unsafe {
+                    bun_core::heap::take(ptr.cast::<Wrapper>())
+                });
+                // SAFETY: each field is read out exactly once.
+                unsafe {
+                    drop(core::ptr::read(&raw const this.store));
+                    drop(core::ptr::read(&raw const this.resolved_list_options));
+                }
+            }
         }
 
         // Wrapper.deinit/destroy bodies deleted — store.deref() via StoreRef::drop,
@@ -508,6 +532,7 @@ impl S3Ext for S3 {
             unsafe { &(*wrapper).resolved_list_options },
             Wrapper::resolve,
             wrapper.cast::<c_void>(),
+            Wrapper::dispose_for_dead_vm,
             proxy,
         )?;
 

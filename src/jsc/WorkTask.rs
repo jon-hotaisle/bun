@@ -29,6 +29,14 @@ pub trait WorkTaskContext: Sized {
     /// because the context is heap-allocated, crosses threads, and is mutated.
     fn run(this: *mut Self, task: *mut WorkTask<Self>);
     fn then(this: *mut Self, global_this: &JSGlobalObject) -> Result<(), crate::JsTerminated>;
+
+    /// Free the context after its owning VM was destroyed (see
+    /// [`crate::vm_handle::DisposeAfterVmDestroyed`]): forget JSC handle
+    /// fields, free everything else.
+    ///
+    /// # Safety
+    /// `this` is live and exclusively owned; the owning VM is gone.
+    unsafe fn dispose_after_vm_destroyed(this: *mut Self);
 }
 
 pub struct WorkTask<Context: WorkTaskContext> {
@@ -55,6 +63,20 @@ unsafe impl<C: WorkTaskContext> Send for WorkTask<C> {}
 
 impl<Context: WorkTaskContext> Taskable for WorkTask<Context> {
     const TAG: TaskTag = Context::TASK_TAG;
+}
+
+// SAFETY: frees `this` exactly once per the trait contract.
+unsafe impl<Context: WorkTaskContext> crate::vm_handle::DisposeAfterVmDestroyed
+    for WorkTask<Context>
+{
+    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
+        // SAFETY: caller owns `this` exclusively. No field of the shell has
+        // entangled drop glue (`vm` is an Arc, `ref_`/`global_this` are plain),
+        // so a normal move-out suffices; only the context needs special care.
+        let task = *unsafe { bun_core::heap::take(this) };
+        // SAFETY: `ctx` is the live context passed to `create_on_js_thread`.
+        unsafe { Context::dispose_after_vm_destroyed(task.ctx) };
+    }
 }
 
 impl<Context: WorkTaskContext> WorkTask<Context> {

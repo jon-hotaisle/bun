@@ -37,7 +37,7 @@ use bun_options_types::schema::api;
 // interior mutability via `JsCell` (= `UnsafeCell` projector). `JsCell` is
 // `#[repr(transparent)]`, so field offsets are unchanged.
 #[bun_jsc::JsClass(name = "Transpiler")]
-#[derive(bun_ptr::RefCounted)]
+#[derive(bun_ptr::ThreadSafeRefCounted)]
 pub struct JSTranspiler {
     pub transpiler: JsCell<Transpiler::Transpiler<'static>>,
     /// Read-only after construction EXCEPT for `config.log`, which is the
@@ -51,10 +51,10 @@ pub struct JSTranspiler {
     // address is stable across the move into `Box<JSTranspiler>` —
     // `transpiler.arena` holds a `&'static Arena` pointing into it.
     pub arena: Box<Arena>,
-    // Intrusive refcount field for `bun_ptr::IntrusiveRc<JSTranspiler>`:
-    // single-thread intrusive `bun.ptr.RefCount` because `*JSTranspiler`
-    // crosses FFI as `m_ctx` (per PORTING.md §Pointers; not `Arc`).
-    pub ref_count: bun_ptr::RefCount<JSTranspiler>,
+    // Intrusive refcount field for `bun_ptr::IntrusiveRc<JSTranspiler>`.
+    // Atomic: the JS wrapper's finalizer and a work-pool transform task can
+    // release their refs from different threads at worker terminate.
+    pub ref_count: bun_ptr::ThreadSafeRefCount<JSTranspiler>,
 }
 
 fn default_transform_options() -> api::TransformOptions {
@@ -681,6 +681,24 @@ pub(crate) type AsyncTransformTask<'a> =
 
 impl<'a> jsc::concurrent_promise_task::ConcurrentPromiseTaskContext for TransformTask<'a> {
     const TASK_TAG: bun_event_loop::TaskTag = bun_event_loop::task_tag::AsyncTransformTask;
+
+    unsafe fn dispose_for_dead_vm(self) {
+        // SAFETY: sole owner. Skip the input's unprotect (dead heap) but drop
+        // its owned bytes; release the WTF ref on the output; deref the
+        // js_instance (atomic refcount; its Drop is JSC-free). `transpiler`
+        // is a ManuallyDrop bitwise copy — never dropped by design.
+        let task = core::mem::ManuallyDrop::new(self);
+        // SAFETY: each owned field is read out exactly once (ManuallyDrop).
+        unsafe {
+            drop(core::ptr::read(&raw const task.input_code).into_inner_for_dead_vm());
+            core::ptr::read(&raw const task.output_code).deref();
+            core::ptr::read(&raw const task.js_instance).deref();
+            drop(core::ptr::read(&raw const task.log));
+            let _ = core::ptr::read(&raw const task.err);
+            drop(core::ptr::read(&raw const task.macro_map));
+            drop(core::ptr::read(&raw const task.replace_exports));
+        }
+    }
     fn run(&mut self) {
         TransformTask::run(self)
     }
@@ -1039,7 +1057,7 @@ impl JSTranspiler {
             scan_pass_result: JsCell::new(ScanPassResult::init()),
             buffer_writer: JsCell::new(None),
             log_level: bun_ast::Level::Err,
-            ref_count: bun_ptr::RefCount::init(),
+            ref_count: bun_ptr::ThreadSafeRefCount::init(),
         });
         // errdefer past this point → `this: Box<_>` drops and runs Drop for JSTranspiler.
 

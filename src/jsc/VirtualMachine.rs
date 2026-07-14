@@ -285,6 +285,11 @@ pub struct VirtualMachine {
     /// VM box is freed.
     pub handle_gate: Option<std::sync::Arc<bun_threading::ShutdownGate>>,
 
+    /// In-flight `fetch()` tasklets (JS-thread only). Each entry holds a ref
+    /// on the tasklet; worker shutdown walks this to detach JSC handles and
+    /// abort transfers while the VM is still alive. Erased `*mut FetchTasklet`.
+    pub live_fetch_tasklets: core::cell::RefCell<Vec<*mut core::ffi::c_void>>,
+
     pub ref_strings: crate::ref_string::Map,
     pub ref_strings_mutex: bun_threading::Mutex,
 
@@ -1616,6 +1621,14 @@ impl VirtualMachine {
                     .close_all_socket_groups(vm_ref);
             }
 
+            // Release the fetch registry refs (and abort/detach the
+            // transfers) while JSC is alive, so `release_at_shutdown`'s two
+            // derefs below can reach zero and route through the drain.
+            if let Some(hooks) = runtime_hooks() {
+                // SAFETY: live per-thread VM on the JS thread, pre-teardown.
+                unsafe { (hooks.detach_fetch_tasklets)(core::ptr::from_mut(self)) };
+            }
+
             // The HTTP daemon thread holds a `Box<ThreadlocalAsyncHTTP>` per
             // in-flight request; with the JS thread exiting those never reach
             // a terminal state. Ask it to reclaim them now (waits up to 1s).
@@ -1845,6 +1858,14 @@ pub struct RuntimeHooks {
     /// `vm` is the live per-thread VM; `runtime_state` must still be installed
     /// and the JSC heap must not have been swept yet.
     pub cancel_all_timers: unsafe fn(vm: *mut VirtualMachine),
+
+    /// Worker-shutdown walk over `vm.live_fetch_tasklets`: aborts each
+    /// transfer and detaches its JSC handles while the VM is still alive, so
+    /// the HTTP thread's last deref can free the box after the gate closes.
+    ///
+    /// # Safety
+    /// `vm` is the live per-thread VM on its own JS thread, pre-teardown.
+    pub detach_fetch_tasklets: unsafe fn(vm: *mut VirtualMachine),
 }
 
 /// Canonical `EventLoopCtx` vtable for a `*mut VirtualMachine` owner — the JS
@@ -2153,6 +2174,8 @@ impl VirtualMachine {
             let _ = (*regular).tasks.ensure_unused_capacity(64);
             addr_of_mut!((*vm).event_loop).write(regular);
 
+            addr_of_mut!((*vm).live_fetch_tasklets)
+                .write(core::cell::RefCell::new(Vec::new()));
             addr_of_mut!((*vm).handle_gate).write(Some(std::sync::Arc::new(
                 bun_threading::ShutdownGate::new(),
             )));

@@ -24,6 +24,9 @@ pub struct S3HttpDownloadStreamingTask {
     pub sign_result: SignResult,
     pub headers: Headers,
     pub callback_context: NonNull<()>,
+    /// Frees `callback_context` when the owning VM died before the final
+    /// `on_response` could run (see `DisposeAfterVmDestroyed` impl below).
+    pub callback_context_dispose: unsafe fn(*mut c_void),
     pub callback: fn(chunk: &MutableString, has_more: bool, err: Option<S3Error>, ctx: *mut c_void),
     pub has_schedule_callback: AtomicBool,
     pub signal_store: bun_http::signals::Store,
@@ -65,6 +68,7 @@ impl Default for S3HttpDownloadStreamingTask {
             sign_result: SignResult::default(),
             headers: Headers::default(),
             callback_context: NonNull::dangling(),
+            callback_context_dispose: crate::webcore::s3::simple_request::noop_context_dispose,
             callback: |_, _, _, _| {},
             range: None,
             proxy_url: Box::default(),
@@ -342,13 +346,52 @@ impl S3HttpDownloadStreamingTask {
         if self_.process_http_callback(async_http, result) {
             // we are always unlocked here and its safe to enqueue
             let vm = self_.vm.clone().expect("vm set at task creation");
-            if !vm.enqueue_intrusive(&mut self_.concurrent_task, this) {
-                // Worker VM destroyed: nothing will ever consume the stream.
-                // Abort the transfer so the body stops accumulating; the task
-                // box is leaked per the `VMHandle::enqueue_task_concurrent`
-                // policy.
-                bun_http::http_thread().schedule_shutdown_by_id(self_.async_http_id);
+            // On `false` (worker VM destroyed) `enqueue_intrusive` runs
+            // `DisposeAfterVmDestroyed`: mid-stream it aborts the transfer and
+            // keeps the task alive; on the final callback it frees everything.
+            let _ = vm.enqueue_intrusive(&mut self_.concurrent_task, this);
+        }
+    }
+}
+
+// SAFETY: frees `this` exactly once per the trait contract (mid-stream calls
+// defer to the final callback, which re-enters via `enqueue_intrusive`).
+// Runs on the HTTP thread when the owning worker VM is destroyed.
+unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for S3HttpDownloadStreamingTask {
+    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
+        // SAFETY: caller owns `this` exclusively (the queue never took it).
+        let state = State(unsafe { (*this).state.load(Ordering::Acquire) });
+        if state.has_more() {
+            // Transfer still in flight: the HTTP client aliases our buffers,
+            // so abort and let the final callback re-enter here to free.
+            // SAFETY: `this` stays live; only atomics are touched.
+            unsafe {
+                (*this).has_schedule_callback.store(false, Ordering::Release);
+                bun_http::http_thread().schedule_shutdown_by_id((*this).async_http_id);
             }
+            return;
+        }
+        // SAFETY: final callback — sole owner. `ManuallyDrop` suppresses
+        // `Drop` (its `poll_ref.unref` would touch the dead VM's loop).
+        let mut task = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
+        // SAFETY: fields are read out of the suppressed value exactly once.
+        unsafe {
+            (task.callback_context_dispose)(task.callback_context.as_ptr().cast());
+            // Mirror `Drop`'s http cleanup (transfer is done, so the HTTP
+            // thread no longer aliases these buffers).
+            let http = task.http.assume_init_mut();
+            http.clear_data();
+            http.request_headers = Default::default();
+            http.client.header_entries = Default::default();
+            // Owned process-heap fields; `poll_ref` (no Drop), atomics,
+            // `mutex`, `signals` and the fn pointers have no drop glue.
+            drop(core::ptr::read(&raw const task.sign_result));
+            drop(core::ptr::read(&raw const task.headers));
+            drop(core::ptr::read(&raw const task.response_buffer));
+            drop(core::ptr::read(&raw const task.reported_response_buffer));
+            drop(core::ptr::read(&raw const task.range));
+            drop(core::ptr::read(&raw const task.proxy_url));
+            drop(core::ptr::read(&raw const task.vm));
         }
     }
 }

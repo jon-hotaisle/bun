@@ -1467,6 +1467,7 @@ pub(crate) static __BUN_RUNTIME_HOOKS: RuntimeHooks = RuntimeHooks {
     terminate_all_workers_and_wait,
     retroactively_report_discovered_tests,
     cancel_all_timers,
+    detach_fetch_tasklets,
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1578,6 +1579,20 @@ fn terminate_all_workers_and_wait(timeout_ms: u64) {
 /// # Safety
 /// `vm` is the live per-thread VM; `runtime_state()` must still be installed.
 /// Must run on the JS thread before JSC teardown.
+unsafe fn detach_fetch_tasklets(vm: *mut VirtualMachine) {
+    // SAFETY: `vm` per fn contract (JS thread, pre-teardown).
+    let list = core::mem::take(&mut *unsafe { &(*vm).live_fetch_tasklets }.borrow_mut());
+    for tasklet in list {
+        // SAFETY: each entry holds a ref (taken in `queue()`), so the pointer
+        // is live; `detach_for_worker_terminate` consumes that ref.
+        unsafe {
+            crate::webcore::fetch::fetch_tasklet::FetchTasklet::detach_for_worker_terminate(
+                tasklet.cast(),
+            );
+        }
+    }
+}
+
 unsafe fn cancel_all_timers(vm: *mut VirtualMachine) {
     let state = runtime_state();
     if state.is_null() {

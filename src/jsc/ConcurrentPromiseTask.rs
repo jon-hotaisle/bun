@@ -17,6 +17,14 @@ pub trait ConcurrentPromiseTaskContext: Sized {
 
     fn run(&mut self);
     fn then(&mut self, promise: &mut JSPromise) -> Result<(), JsTerminated>;
+
+    /// Consume the context after its owning VM was destroyed (see
+    /// [`crate::vm_handle::DisposeAfterVmDestroyed`]): forget JSC handle
+    /// fields, free everything else.
+    ///
+    /// # Safety
+    /// The owning VM is gone; must not touch it or its loop.
+    unsafe fn dispose_for_dead_vm(self);
 }
 
 /// A generic task that runs work on a thread pool and resolves a JavaScript Promise with the result.
@@ -51,6 +59,22 @@ unsafe impl<C: ConcurrentPromiseTaskContext> Send for ConcurrentPromiseTask<'_, 
 
 impl<Context: ConcurrentPromiseTaskContext> Taskable for ConcurrentPromiseTask<'_, Context> {
     const TAG: TaskTag = Context::TASK_TAG;
+}
+
+// SAFETY: frees `this` exactly once per the trait contract.
+unsafe impl<Context: ConcurrentPromiseTaskContext> crate::vm_handle::DisposeAfterVmDestroyed
+    for ConcurrentPromiseTask<'_, Context>
+{
+    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
+        // SAFETY: sole owner; ManuallyDrop suppresses the promise's dead
+        // handle-slot release. `ctx` and the gate Arc are read out once.
+        let task = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
+        // SAFETY: each field is read out exactly once from the suppressed value.
+        unsafe {
+            Context::dispose_for_dead_vm(*core::ptr::read(&raw const task.ctx));
+            drop(core::ptr::read(&raw const task.vm));
+        }
+    }
 }
 
 impl<'a, Context: ConcurrentPromiseTaskContext> ConcurrentPromiseTask<'a, Context> {

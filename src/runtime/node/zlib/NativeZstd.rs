@@ -34,10 +34,11 @@ mod _impl {
     // `host_fn_this` shim still passes `&mut NativeZstd` — `&mut T` auto-reborrows
     // to `&T` so the impls below compile against either.
     #[bun_jsc::JsClass]
-    #[derive(bun_ptr::CellRefCounted)]
+    #[derive(bun_ptr::ThreadSafeRefCounted)]
+    #[ref_count(destroy = Self::destroy_on_zero)]
     pub struct NativeZstd {
         // Intrusive single-thread refcount.
-        pub ref_count: Cell<u32>,
+        pub ref_count: bun_ptr::ThreadSafeRefCount<NativeZstd>,
         // LIFETIMES.tsv: JSC_BORROW. The global outlives this m_ctx payload;
         // `BackRef` centralises the single unsafe deref so the trait impl is safe.
         pub global_this: bun_ptr::BackRef<JSGlobalObject>,
@@ -104,7 +105,7 @@ mod _impl {
                 ..Default::default()
             };
             Ok(Box::new(Self {
-                ref_count: Cell::new(1), // RefCount.init()
+                ref_count: bun_ptr::ThreadSafeRefCount::init(),
                 // JSC_BORROW — the JSGlobalObject outlives this payload (the C++
                 // wrapper is owned by that global's heap).
                 global_this: bun_ptr::BackRef::new(global),
@@ -272,6 +273,25 @@ mod _impl {
                 NodeMode::ZSTD_COMPRESS | NodeMode::ZSTD_DECOMPRESS => s.close(),
                 _ => {}
             });
+        }
+    }
+
+    impl NativeZstd {
+        /// Refcount destroy target. Off the JS thread (worker terminated —
+        /// a work-pool completion held the last ref) the handle slots died
+        /// with the VM and must be forgotten, not released.
+        fn destroy_on_zero(this: *mut Self) {
+            // SAFETY: refcount hit zero ⇒ sole owner; Box from `constructor`.
+            unsafe {
+                let boxed = bun_core::heap::take(this);
+                // Gate closed ⇒ owning VM torn down: forget the dead handle
+                // slots instead of releasing them (see NativeZlib::deinit).
+                if boxed.vm.with(|_| ()).is_none() {
+                    let _ = core::mem::ManuallyDrop::new(boxed.this_value.replace(Default::default()));
+                    let _ = core::mem::ManuallyDrop::new(boxed.poll_ref.replace(Default::default()));
+                }
+                drop(boxed);
+            }
         }
     }
 

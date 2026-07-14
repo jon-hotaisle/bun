@@ -81,6 +81,14 @@ macro_rules! extern_crypto_job {
             }
 
             impl AnyTaskJobCtx for ExternCtx {
+                unsafe fn dispose_for_dead_vm(self) {
+                    // SAFETY: sole owner. The C++ ctx holds boringssl-only
+                    // state (no JSC handles); the callback slot died with
+                    // the VM's HandleSet.
+                    let this = core::mem::ManuallyDrop::new(self);
+                    ctx_deinit(Ctx::opaque_ref(this.ctx));
+                }
+
                 fn run(&mut self, global: *mut JSGlobalObject) {
                     ctx_run_task(Ctx::opaque_ref(self.ctx), global);
                 }
@@ -174,6 +182,13 @@ pub trait CryptoJobCtx: Sized {
     fn run_task(&mut self);
     fn run_from_js(&mut self, global: &JSGlobalObject, callback: JSValue);
     fn deinit(&mut self);
+
+    /// Consume the ctx after the owning VM was destroyed: forget JSC handle
+    /// fields / skip unprotects (slots died with the heap), free owned bytes.
+    ///
+    /// # Safety
+    /// The owning VM is gone; must not touch it or its loop.
+    unsafe fn dispose_for_dead_vm(self);
 }
 
 /// Adapter binding a [`CryptoJobCtx`] + JS callback into an [`AnyTaskJobCtx`].
@@ -184,6 +199,13 @@ pub struct CallbackCtx<C: CryptoJobCtx> {
 }
 
 impl<C: CryptoJobCtx> AnyTaskJobCtx for CallbackCtx<C> {
+    unsafe fn dispose_for_dead_vm(self) {
+        // SAFETY: sole owner; the callback slot died with the VM's HandleSet.
+        let this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `inner` is read out of the suppressed value exactly once.
+        unsafe { C::dispose_for_dead_vm(core::ptr::read(&raw const this.inner)) };
+    }
+
     #[inline]
     fn init(&mut self, global: &JSGlobalObject) -> JsResult<()> {
         self.inner.init(global)
@@ -256,6 +278,11 @@ pub mod random {
     pub(crate) const MAX_RANGE: i64 = 0xffff_ffff_ffff;
 
     impl CryptoJobCtx for JobCtx {
+        unsafe fn dispose_for_dead_vm(self) {
+            // Skip the unprotect of `value` (dead heap); `scratch` drops.
+            drop(self.scratch);
+        }
+
         fn init(&mut self, _: &JSGlobalObject) -> JsResult<()> {
             self.value.protect();
             Ok(())
@@ -1019,6 +1046,18 @@ mod _impl {
     }
 
     impl CryptoJobCtx for Scrypt {
+        unsafe fn dispose_for_dead_vm(self) {
+            // SAFETY: sole owner. Skip the password/salt unprotect and the
+            // `buf` handle release (dead heap); the StringOrBuffers' own Drop
+            // frees their owned bytes.
+            let this = core::mem::ManuallyDrop::new(self);
+            // SAFETY: fields are read out of the suppressed value exactly once.
+            unsafe {
+                drop(core::ptr::read(&raw const this.password));
+                drop(core::ptr::read(&raw const this.salt));
+            }
+        }
+
         fn init(&mut self, global: &JSGlobalObject) -> JsResult<()> {
             if self.keylen as usize > jsc::virtual_machine::synthetic_allocation_limit() {
                 return Err(global.throw_out_of_memory());

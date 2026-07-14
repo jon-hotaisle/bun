@@ -403,6 +403,11 @@ pub(super) mod lib_uv_backend {
             (*holder).task = jsc::AnyTask::AnyTask {
                 ctx: NonNull::new(holder.cast()),
                 callback: Holder::run,
+                dispose: Some(|p| {
+                    // The libuv request the holder points at is owned by the
+                    // loop; only the queue-owned box itself is freed.
+                    drop(bun_core::heap::take(p.cast::<Holder>()));
+                }),
             };
             (*this)
                 .head
@@ -1359,6 +1364,22 @@ pub mod get_addr_info_request {
 impl jsc::work_task::WorkTaskContext for GetAddrInfoRequest {
     const TASK_TAG: bun_event_loop::ConcurrentTask::TaskTag =
         bun_event_loop::ConcurrentTask::task_tag::GetAddrInfoRequestTask;
+
+    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
+        // SAFETY: sole owner. `backend` (owned heap) is read out and dropped;
+        // each pending `DNSLookup` box is freed with its Drop bypassed (its
+        // unref/deref targets and promise slots all died with the VM).
+        let req = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
+        // SAFETY: backend/chain nodes are read out exactly once (ManuallyDrop).
+        unsafe {
+            drop(core::ptr::read(&raw const req.backend));
+            let mut next = req.head.next;
+            while let Some(node) = next {
+                let node = core::mem::ManuallyDrop::new(*bun_core::heap::take(node.as_ptr()));
+                next = node.next;
+            }
+        }
+    }
 
     #[inline]
     fn run(this: *mut Self, task: *mut get_addr_info_request::Task) {

@@ -690,6 +690,9 @@ impl AsyncModule {
                     Self::on_done(p.cast());
                     Ok(())
                 },
+                // Same-thread enqueue; reclaimed by the shutdown queue drain
+                // while the VM is still alive, never by a dead-VM dispose.
+                dispose: None,
             };
             jsc_vm.enqueue_task(Task::init(&raw mut (*clone).any_task));
         }

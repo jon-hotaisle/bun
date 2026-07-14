@@ -99,6 +99,24 @@ impl JSBundleCompletionTask {
     }
 }
 
+// SAFETY: frees `this` exactly once per the trait contract.
+unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for JSBundleCompletionTask {
+    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
+        // The JS-thread-affine refcount is bypassed (its keepalive ref can
+        // never be released) and the box force-freed; promise slot and plugin
+        // cell died with the VM, owned buffers are read out and dropped.
+        // SAFETY: sole owner per the trait contract.
+        let task = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
+        // SAFETY: each owned field is read out exactly once (ManuallyDrop).
+        unsafe {
+            drop(core::ptr::read(&raw const task.config));
+            drop(core::ptr::read(&raw const task.log));
+            drop(core::ptr::read(&raw const task.result));
+            drop(core::ptr::read(&raw const task.vm));
+        }
+    }
+}
+
 // SAFETY: enqueued onto the bundle thread; field access is serialized by
 // the producer/consumer handshake (`UnboundedQueue` + `Waker`). Additionally,
 // `ref_count` is the non-atomic `RefCount<Self>` (a `Cell<u32>`; its
@@ -138,7 +156,11 @@ pub(crate) fn create_and_schedule_completion_task(
     // SAFETY: freshly-boxed allocation with ref_count == 1; sole handle.
     unsafe {
         (*completion).task =
-            AnyTask::from_typed(completion, JSBundleCompletionTask::on_complete_anytask);
+            AnyTask::from_typed_with_dispose(
+                completion,
+                JSBundleCompletionTask::on_complete_anytask,
+                <JSBundleCompletionTask as bun_jsc::vm_handle::DisposeAfterVmDestroyed>::dispose_after_vm_destroyed,
+            );
         if let Some(plugin) = (*completion).plugins {
             (*plugin.as_ptr()).set_config(completion.cast());
         }
@@ -780,8 +802,8 @@ static COMPLETION_VTABLE: dispatch::CompletionDispatch = dispatch::CompletionDis
     enqueue_task_concurrent: |c, task| {
         // SAFETY: `task` is a fresh heap-allocated non-null `ConcurrentTaskItem`
         // passed through from the bundler vtable; on success the queue takes
-        // ownership, on `false` (worker VM destroyed) it is parked with the
-        // completion per the `VMHandle::enqueue_task_concurrent` policy.
+        // ownership, on `false` (worker VM destroyed) both the item and the
+        // completion are freed here.
         let completion = from_completion_handle(c);
         let queued = completion.vm.enqueue_task_concurrent(|| {
             // SAFETY: `task` is non-null per the vtable contract (fresh heap
@@ -789,7 +811,11 @@ static COMPLETION_VTABLE: dispatch::CompletionDispatch = dispatch::CompletionDis
             unsafe { core::ptr::NonNull::new_unchecked(task) }
         });
         if !queued {
-            bun_jsc::vm_handle::park_leak(task.cast());
+            // Owning VM destroyed mid-bundle (plugin build, unpinned): drop
+            // the item; the run's final `complete_on_bundle_thread` frees the
+            // completion when its own enqueue fails.
+            // SAFETY: the queue never took the item; sole owner here.
+            drop(unsafe { bun_core::heap::take(task) });
         }
     },
 };
@@ -1001,17 +1027,39 @@ impl CompletionStruct for JSBundleCompletionTask {
         Ok(())
     }
 
+    fn pin_vm_for_bundle(&self) -> bun_bundler::BundleThread::BundlePin {
+        use bun_bundler::BundleThread::BundlePin;
+        if self.plugins.is_some() {
+            // See `BundlePin::Unpinned` — plugin builds round-trip through
+            // the owning JS thread mid-bundle.
+            return BundlePin::Unpinned;
+        }
+        match self.vm.pin_for_bounded_work() {
+            Some(guard) => BundlePin::Pinned(guard),
+            None => BundlePin::VmGone,
+        }
+    }
+
     fn complete_on_bundle_thread(&mut self) {
         // On success, `ConcurrentTask::create` heap-allocates a fresh task and
         // the queue takes ownership; on `false` (worker VM destroyed) the
-        // completion is parked per the `VMHandle::enqueue_task_concurrent`
-        // policy.
+        // completion is freed here — the bundle thread holds the last live
+        // handle and the VM (with its keepalive ref) is gone.
         let vm = self.vm.clone();
         let any_task = self.task.task();
         if !vm.enqueue_task_concurrent(|| jsc::ConcurrentTask::create(any_task)) {
-            bun_jsc::vm_handle::park_leak(core::ptr::from_mut(self).cast());
+            // Owning VM destroyed: the bundle thread holds the last live
+            // reference and this is the run's final completion touch
+            // (`CompletionStruct::complete_on_bundle_thread` contract).
+            // SAFETY: sole owner; nothing touches `self` after this call.
+            unsafe {
+                <Self as bun_jsc::vm_handle::DisposeAfterVmDestroyed>::dispose_after_vm_destroyed(
+                    core::ptr::from_mut(self),
+                );
+            }
         }
     }
+
     fn set_result(&mut self, result: BundleV2Result) {
         self.result = result;
     }

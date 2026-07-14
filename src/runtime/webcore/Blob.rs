@@ -609,6 +609,15 @@ impl BlobExt for Blob {
                     }
                     Ok(())
                 }
+
+                /// # Safety
+                /// Dead-VM path only: caller owns `ptr` exclusively.
+                unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
+                    // No JSC handles: `blob`'s StoreRef deref is thread-safe,
+                    // `ctx` is caller-owned, `poll` (KeepAlive) has no Drop.
+                    // SAFETY: same heap ctx `run`/the callback would have consumed; sole owner.
+                    drop(unsafe { bun_core::heap::take(ptr.cast::<Task<H>>()) });
+                }
             }
             let mut t = Box::new(Task::<H> {
                 ctx,
@@ -650,6 +659,7 @@ impl BlobExt for Blob {
                     len,
                     Task::<H>::cb,
                     t_ptr,
+                    Task::<H>::dispose_for_dead_vm,
                     proxy.as_deref(),
                     payer,
                 )?;
@@ -659,6 +669,7 @@ impl BlobExt for Blob {
                     path,
                     Task::<H>::cb,
                     t_ptr,
+                    Task::<H>::dispose_for_dead_vm,
                     proxy.as_deref(),
                     payer,
                 )?;
@@ -704,6 +715,7 @@ impl BlobExt for Blob {
                 self.store().expect("infallible: store present").clone(),
                 ctx.cast::<c_void>(),
                 NewInternalReadFileHandler::<C, F>::run,
+                NewInternalReadFileHandler::<C, F>::dispose_nothing,
                 self.offset.get(),
                 self.size.get(),
             )
@@ -3901,6 +3913,10 @@ impl<C, F> NewInternalReadFileHandler<C, F>
 where
     F: InternalReadFileFn<C>,
 {
+    /// Dead-VM dispose: the ctx is a JS-heap-rooted reader state that died
+    /// with the VM — nothing to free from here.
+    pub unsafe fn dispose_nothing(_handler: *mut c_void) {}
+
     /// Type-erased thunk: `handler` is the `*mut C` ctx that was passed into
     /// `ReadFile`/`ReadFileUV` cast to `*mut c_void`.
     pub fn run(handler: *mut c_void, bytes: read_file::ReadFileResultType) {
@@ -4674,6 +4690,13 @@ fn write_file_with_empty_source_to_destination(
                     }
                     Ok(())
                 }
+
+                /// # Safety
+                /// Dead-VM path only: caller owns `ptr` exclusively and the
+                /// owning VM (and `promise`'s slot storage) is gone.
+                unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
+                    crate::s3_dispose_promise_store_ctx!(Wrapper, ptr);
+                }
             }
 
             let promise = jsc::JSPromiseStrong::init(ctx);
@@ -4700,6 +4723,7 @@ fn write_file_with_empty_source_to_destination(
                     global: bun_ptr::BackRef::new(ctx),
                 }))
                 .cast::<c_void>(),
+                Wrapper::dispose_for_dead_vm,
             )?;
             return Ok(promise_value);
         }
@@ -4779,6 +4803,7 @@ pub fn write_file_with_source_destination(
                 source_blob.borrowed_view(),
                 write_file_promise,
                 WriteFilePromise::run,
+                WriteFilePromise::dispose_for_dead_vm,
                 options.mkdirp_if_not_exists.unwrap_or(true),
             )
             .expect("unreachable");
@@ -4958,6 +4983,13 @@ pub fn write_file_with_source_destination(
                             }
                             Ok(())
                         }
+
+                        /// # Safety
+                        /// Dead-VM path only: caller owns `ptr` exclusively and
+                        /// the owning VM (and `promise`'s slot storage) is gone.
+                        unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
+                            crate::s3_dispose_promise_store_ctx!(Wrapper, ptr);
+                        }
                     }
                     let promise = jsc::JSPromiseStrong::init(ctx);
                     let promise_value = promise.value();
@@ -4981,6 +5013,7 @@ pub fn write_file_with_source_destination(
                             global: bun_ptr::BackRef::new(ctx),
                         }))
                         .cast::<c_void>(),
+                        Wrapper::dispose_for_dead_vm,
                     )?;
                     return Ok(promise_value);
                 }
@@ -5896,6 +5929,21 @@ impl S3BlobDownloadTask {
         Ok(())
     }
 
+    /// # Safety
+    /// Dead-VM path only: caller owns `ptr` exclusively and the owning VM
+    /// (and `promise`'s slot storage) is gone.
+    unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
+        // `ManuallyDrop` skips `Drop` (`poll_ref.unref` would touch the dead
+        // VM's loop) and forgets `promise`; the blob's `StoreRef` deref is
+        // thread-safe; `global_this`/`handler` are non-owning.
+        // SAFETY: same heap ctx `run`/the callback would have consumed; sole owner.
+        let this = core::mem::ManuallyDrop::new(*unsafe {
+            bun_core::heap::take(ptr.cast::<S3BlobDownloadTask>())
+        });
+        // SAFETY: fields are read out of the suppressed value exactly once.
+        drop(unsafe { core::ptr::read(&raw const this.blob) });
+    }
+
     pub fn init(
         global_this: &JSGlobalObject,
         blob: &Blob,
@@ -5952,6 +6000,7 @@ impl S3BlobDownloadTask {
                 len,
                 s3_cb,
                 this.cast::<c_void>(),
+                Self::dispose_for_dead_vm,
                 proxy,
                 s3_store.request_payer,
             )?;
@@ -5961,6 +6010,7 @@ impl S3BlobDownloadTask {
                 path,
                 s3_cb,
                 this.cast::<c_void>(),
+                Self::dispose_for_dead_vm,
                 proxy,
                 s3_store.request_payer,
             )?;
@@ -5974,6 +6024,7 @@ impl S3BlobDownloadTask {
                 Some(len),
                 s3_cb,
                 this.cast::<c_void>(),
+                Self::dispose_for_dead_vm,
                 proxy,
                 s3_store.request_payer,
             )?;

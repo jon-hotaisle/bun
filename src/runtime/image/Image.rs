@@ -1377,6 +1377,21 @@ pub type AsyncImageTask<'a> = ConcurrentPromiseTask<'a, PipelineTask<'a>>;
 
 impl<'a> ConcurrentPromiseTaskContext for PipelineTask<'a> {
     const TASK_TAG: bun_event_loop::TaskTag = bun_event_loop::task_tag::AsyncImageTask;
+
+    unsafe fn dispose_for_dead_vm(self) {
+        // SAFETY: sole owner. The pin on `input.pinned` and the `WriteDest`
+        // Strong died with the VM's HandleSet — forget them; owned bytes
+        // (`copied`, encode result, pipeline state) drop normally.
+        let task = core::mem::ManuallyDrop::new(self);
+        // SAFETY: each owned field is read out exactly once (ManuallyDrop).
+        unsafe {
+            drop(core::ptr::read(&raw const task.input.copied));
+            drop(core::ptr::read(&raw const task.result));
+            if let Deliver::WriteDest(strong) = core::ptr::read(&raw const task.deliver) {
+                let _ = core::mem::ManuallyDrop::new(strong);
+            }
+        }
+    }
     #[inline]
     fn run(&mut self) {
         PipelineTask::run(self)

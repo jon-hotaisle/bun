@@ -73,6 +73,7 @@ unsafe extern "C" {
     fn NapiEnv__hasPendingException(env: *mut NapiEnv) -> bool;
     fn napi_internal_get_version(env: *mut NapiEnv) -> u32;
     fn NapiEnv__deref(env: *mut NapiEnv);
+    fn NapiEnv__derefAfterVmDestroyed(env: *mut NapiEnv);
     fn NapiEnv__ref(env: *mut NapiEnv);
     fn napi_set_last_error(env: napi_env, status: NapiStatus) -> napi_status;
 }
@@ -1738,6 +1739,21 @@ pub struct napi_async_work {
 }
 
 bun_threading::intrusive_work_task!(napi_async_work, task);
+
+// SAFETY: frees `this` exactly once per the trait contract.
+unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for napi_async_work {
+    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
+        // SAFETY: sole owner. The C++ helper neutralizes the env's pending-
+        // exception slot (died with the VM) before deref'ing; `data` stays
+        // addon-owned, same contract as Node when a worker dies mid-work.
+        let work = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
+        // SAFETY: env ptr is live (our ref); vm Arc read out exactly once.
+        unsafe {
+            NapiEnv__derefAfterVmDestroyed(work.env.as_ptr());
+            drop(core::ptr::read(&raw const work.vm));
+        }
+    }
+}
 
 impl napi_async_work {
     pub fn new(

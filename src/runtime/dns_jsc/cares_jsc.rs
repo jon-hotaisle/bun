@@ -718,6 +718,17 @@ impl ErrorDeferred {
             }
         }
 
+        // Reclaim for a rejection still queued at worker teardown: the
+        // promise's handle slot died with the VM's HandleSet — forget it;
+        // the error strings drop normally.
+        fn cleanup(p: *mut core::ffi::c_void) {
+            // SAFETY: `p` is the heap `Context` enqueued below, unrun.
+            let mut ctx = unsafe { bun_core::heap::take(p.cast::<Context>()) };
+            let _ =
+                core::mem::ManuallyDrop::new(core::mem::take(&mut ctx.deferred.promise));
+            drop(ctx);
+        }
+
         let context = bun_core::heap::into_raw(Box::new(Context {
             deferred: self,
             global_this: bun_ptr::BackRef::new(global_this),
@@ -728,9 +739,10 @@ impl ErrorDeferred {
         global_this
             .bun_vm()
             .as_mut()
-            .enqueue_task(bun_jsc::ManagedTask::ManagedTask::new(
+            .enqueue_task(bun_jsc::ManagedTask::ManagedTask::new_with_cleanup(
                 context,
                 Context::callback,
+                cleanup,
             ));
     }
 }

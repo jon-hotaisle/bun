@@ -56,6 +56,19 @@ pub struct BundleThread<C: Node> {
 ///
 /// The trait accessors keep the generic `BundleThread<C>`
 /// layout-agnostic. The concrete impl lives in T6 (`bun_bundler_jsc`).
+/// Result of [`CompletionStruct::pin_vm_for_bundle`].
+pub enum BundlePin {
+    /// VM pinned for the run; drop after the bundle completes.
+    Pinned(bun_threading::GateGuest),
+    /// Run without a pin: plugin builds round-trip through the owning JS
+    /// thread mid-bundle, and holding the pin across that would deadlock
+    /// worker terminate (gate close waits on the pin, the bundle waits on
+    /// the JS thread). FIXME: give plugin builds a cancel signal instead.
+    Unpinned,
+    /// VM already destroyed; skip the run.
+    VmGone,
+}
+
 pub trait CompletionStruct: Node + Send + 'static {
     /// `bump` is the per-build mimalloc heap that backs `transpiler`, so the
     /// two share lifetime `'a` (option fields like `optimize_imports: &'a
@@ -65,7 +78,15 @@ pub trait CompletionStruct: Node + Send + 'static {
         transpiler: &mut Transpiler<'a>,
         bump: &'a Arena,
     ) -> Result<(), crate::Error>;
+    /// May free `self` (a failed completion enqueue means the owning VM is
+    /// destroyed and the bundle thread holds the last reference) — callers
+    /// must not touch the completion afterwards.
     fn complete_on_bundle_thread(&mut self);
+    /// Pin the owning VM for the duration of the bundle: the run reads
+    /// VM-owned state (env loader, plugins) that worker terminate would
+    /// otherwise free mid-bundle. The guard may outlive `self`.
+    #[must_use]
+    fn pin_vm_for_bundle(&self) -> BundlePin;
     fn set_result(&mut self, result: BundleV2Result);
     fn set_log(&mut self, log: bun_ast::Log);
     fn set_transpiler(&mut self, this: *mut BundleV2<'_>);
@@ -75,7 +96,7 @@ pub trait CompletionStruct: Node + Send + 'static {
     fn file_map(&mut self) -> Option<NonNull<FileMap>>;
     /// Returns a §Dispatch handle (erased owner + `&'static` vtable) the impl
     /// provides, so the bundler can read `result == .err` /
-    /// `jsc_event_loop.enqueueTaskConcurrent` without naming the concrete
+    /// `vm.enqueue_task_concurrent` without naming the concrete
     /// struct.
     fn as_js_bundle_completion_task(&mut self) -> dispatch::CompletionHandle;
 
@@ -226,14 +247,26 @@ impl<C: CompletionStruct> BundleThread<C> {
                 // `panic = "abort"` → a Rust panic on this thread enters the
                 // crash-handler hook and aborts the whole process.
                 // No `catch_unwind` — there is nothing to catch.
-                match Self::generate_in_new_thread(completion, generation) {
-                    Ok(()) => {}
-                    Err(err) => {
-                        completion.set_result(BundleV2Result::Err(err));
+                match completion.pin_vm_for_bundle() {
+                    BundlePin::VmGone => {
+                        // Owning VM destroyed before the bundle started: skip
+                        // the run; the failed enqueue frees the completion.
                         completion.complete_on_bundle_thread();
                     }
+                    pin => {
+                        match Self::generate_in_new_thread(completion, generation) {
+                            Ok(()) => {}
+                            Err(err) => {
+                                completion.set_result(BundleV2Result::Err(err));
+                                completion.complete_on_bundle_thread();
+                            }
+                        }
+                        // `completion` may already be freed (failed enqueue)
+                        // or owned by the JS thread — only `pin` is touched.
+                        drop(pin);
+                        has_bundled = true;
+                    }
                 }
-                has_bundled = true;
             }
             // SAFETY: `generation` is only read/written on this (bundle) thread.
             unsafe {

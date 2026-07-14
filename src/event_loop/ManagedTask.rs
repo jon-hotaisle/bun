@@ -58,6 +58,27 @@ impl ManagedTask {
         ManagedTask::task(managed)
     }
 
+    /// [`Self::new`] plus a cleanup run when the task is reclaimed unrun at
+    /// VM teardown (`EventLoop::deinit`); the cleanup must free `ctx` without
+    /// touching the dead VM.
+    pub fn new_with_cleanup<T>(
+        ctx: *mut T,
+        callback: fn(*mut T) -> JsResult<()>,
+        cleanup: fn(*mut c_void),
+    ) -> Task {
+        let managed = bun_core::heap::into_raw(Box::new(ManagedTask {
+            // SAFETY: same fn-pointer ABI cast as `new`.
+            callback: unsafe {
+                bun_ptr::cast_fn_ptr::<fn(*mut T) -> JsResult<()>, fn(*mut c_void) -> JsResult<()>>(
+                    callback,
+                )
+            },
+            ctx: NonNull::new(ctx.cast::<c_void>()),
+            cleanup: Some(cleanup),
+        }));
+        ManagedTask::task(managed)
+    }
+
     pub fn new_owned<T>(ctx: *mut T, callback: fn(*mut T) -> JsResult<()>) -> Task {
         fn drop_ctx<T>(p: *mut c_void) {
             // SAFETY: `p` is the `heap::into_raw(Box<T>)` stored in `ctx` by `new_owned`.

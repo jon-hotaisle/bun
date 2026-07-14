@@ -600,7 +600,11 @@ impl<Op: PasswordOp> PasswordJob<Op> {
         // SAFETY: `result` was just heap-allocated and is not yet shared
         // (enqueue happens after this write).
         unsafe {
-            (*result).task = AnyTask::from_typed(result, PasswordResult::<Op>::run_from_js_erased);
+            (*result).task = AnyTask::from_typed_with_dispose(
+                result,
+                PasswordResult::<Op>::run_from_js_erased,
+                PasswordResult::<Op>::dispose_after_vm_destroyed,
+            );
         }
         // On success, ownership of `result` transfers to the event loop; on
         // `false` (worker VM destroyed) it is leaked per the
@@ -611,7 +615,15 @@ impl<Op: PasswordOp> PasswordJob<Op> {
             ConcurrentTask::create_from(unsafe { core::ptr::addr_of_mut!((*result).task) })
         });
         if !queued {
-            bun_jsc::vm_handle::park_leak(result.cast());
+            // Owning worker VM destroyed: free the result here. The promise's
+            // handle slot died with the VM's HandleSet — forget it; `value`
+            // (owned hash bytes / error) drops normally. KeepAlive has no
+            // Drop and the dead loop must not be unref'd.
+            // SAFETY: `result` was just allocated above and never shared (the
+            // enqueue failed), so this thread is the sole owner.
+            let mut boxed = unsafe { bun_core::heap::take(result) };
+            let _ = core::mem::ManuallyDrop::new(core::mem::take(&mut boxed.promise));
+            drop(boxed);
         }
         // `self: Box<Self>` drops here; Drop runs secure_zero on password (+op).
     }
@@ -626,6 +638,18 @@ struct PasswordResult<Op: PasswordOp> {
 }
 
 impl<Op: PasswordOp> PasswordResult<Op> {
+    /// Dead-VM dispose for the queued completion (see `AnyTask::dispose`).
+    ///
+    /// # Safety
+    /// `p` is the queue-owned heap result; the owning worker VM is torn down.
+    unsafe fn dispose_after_vm_destroyed(p: *mut Self) {
+        // SAFETY: sole owner. The promise slot died with the VM's HandleSet;
+        // `value` (owned hash bytes / error) drops normally.
+        let mut boxed = unsafe { bun_core::heap::take(p) };
+        let _ = core::mem::ManuallyDrop::new(core::mem::take(&mut boxed.promise));
+        drop(boxed);
+    }
+
     fn run_from_js_erased(p: *mut Self) -> AnyTaskJsResult<()> {
         Self::run_from_js(p)
             .map_err(|_: jsc::JsTerminated| bun_event_loop::ErasedJsError::Terminated)

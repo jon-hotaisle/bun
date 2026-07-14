@@ -69,10 +69,10 @@ mod _impl {
     // R-2 (host-fn re-entrancy): every JS-exposed method takes `&self`; per-field
     // interior mutability via `Cell` (Copy) / `JsCell` (non-Copy).
     #[bun_jsc::JsClass]
-    #[derive(bun_ptr::CellRefCounted)]
+    #[derive(bun_ptr::ThreadSafeRefCounted)]
     #[ref_count(destroy = Self::destroy_on_zero)]
     pub struct NativeBrotli {
-        pub ref_count: Cell<u32>,
+        pub ref_count: bun_ptr::ThreadSafeRefCount<NativeBrotli>,
         // JSC_BORROW backref; global outlives this m_ctx payload. `BackRef`
         // centralises the single unsafe deref so the trait impl is safe.
         pub global_this: bun_ptr::BackRef<JSGlobalObject>,
@@ -139,7 +139,7 @@ mod _impl {
                 ..Default::default()
             };
             Ok(Box::new(Self {
-                ref_count: Cell::new(1),
+                ref_count: bun_ptr::ThreadSafeRefCount::init(),
                 // JSC_BORROW backref — the global outlives this m_ctx payload.
                 global_this: bun_ptr::BackRef::new(global_this),
                 vm: global_this.bun_vm().cross_thread_handle(),
@@ -296,6 +296,29 @@ mod _impl {
         /// Safe fn: only reachable via the `#[ref_count(destroy = …)]` derive,
         /// whose generated trait `destroy` upholds the sole-owner contract.
         fn destroy_on_zero(this: *mut Self) {
+            // Off the JS thread (worker terminated — a work-pool completion
+            // held the last ref) the handle slots died with the VM and must
+            // be forgotten, not released; the brotli state still closes.
+            // SAFETY: refcount hit zero ⇒ sole owner.
+            let vm_gone = unsafe { (*this).vm.with(|_| ()).is_none() };
+            // Gate closed ⇒ owning VM torn down: forget the dead handle
+            // slots instead of releasing them (see NativeZlib::deinit).
+            if vm_gone {
+                // SAFETY: refcount hit zero ⇒ sole owner; Box from `constructor`.
+                unsafe {
+                    (*this).stream.with_mut(|s| match s.mode {
+                        bun_zlib::NodeMode::BROTLI_ENCODE | bun_zlib::NodeMode::BROTLI_DECODE => {
+                            s.close();
+                        }
+                        _ => {}
+                    });
+                    let boxed = bun_core::heap::take(this);
+                    let _ = core::mem::ManuallyDrop::new(boxed.this_value.replace(Default::default()));
+                    let _ = core::mem::ManuallyDrop::new(boxed.poll_ref.replace(Default::default()));
+                    drop(boxed);
+                }
+                return;
+            }
             // SAFETY: refcount hit zero ⇒ no other borrow remains.
             unsafe { (*this).deinit() };
             // SAFETY: allocated via `Box::new` in `constructor`.

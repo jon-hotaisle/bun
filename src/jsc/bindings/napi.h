@@ -447,6 +447,12 @@ public:
         return true;
     }
 
+    void neutralizePendingExceptionAfterVmDestroyed()
+    {
+        // Placement-reinit: forget the dead handle slot without touching it.
+        new (&m_pendingException) JSC::Strong<JSC::Unknown>();
+    }
+
     void clearPendingException()
     {
         m_pendingException.clear();

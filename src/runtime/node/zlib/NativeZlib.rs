@@ -35,10 +35,10 @@ mod _impl {
     /// `ref`/`deref` are provided by `bun_ptr::IntrusiveRc<NativeZlib>`; when the count hits
     /// zero it invokes [`NativeZlib::deinit`].
     #[bun_jsc::JsClass]
-    #[derive(bun_ptr::CellRefCounted)]
+    #[derive(bun_ptr::ThreadSafeRefCounted)]
     #[ref_count(destroy = Self::deinit)]
     pub struct NativeZlib {
-        pub ref_count: Cell<u32>,
+        pub ref_count: bun_ptr::ThreadSafeRefCount<NativeZlib>,
         // JSC_BORROW backref; global outlives this m_ctx payload. `BackRef`
         // centralises the single unsafe deref so the trait impl is safe.
         pub global_this: bun_ptr::BackRef<JSGlobalObject>,
@@ -93,7 +93,7 @@ mod _impl {
                 ..Default::default()
             };
             Ok(Box::new(Self {
-                ref_count: Cell::new(1),
+                ref_count: bun_ptr::ThreadSafeRefCount::init(),
                 // JSC_BORROW backref — the global outlives this m_ctx payload.
                 global_this: bun_ptr::BackRef::new(global),
                 vm: global.bun_vm().cross_thread_handle(),
@@ -257,13 +257,24 @@ mod _impl {
         /// Not `Drop` because this is an intrusive-refcounted `m_ctx` payload whose
         /// box is freed here.
         fn deinit(this: *mut Self) {
-            // SAFETY: called exactly once by IntrusiveRc when refcount hits 0; `this`
-            // is the heap::alloc pointer produced at construction. `this_value`
-            // (Strong) and `poll_ref` (CountedKeepAlive) are Drop types — freed by
-            // heap::take below.
+            // SAFETY: called exactly once when the atomic refcount hits 0;
+            // `this` is the heap::alloc pointer produced at construction. On
+            // the JS thread `this_value`/`poll_ref` release normally via
+            // field drop glue; off the JS thread (worker terminated — a
+            // work-pool completion held the last ref) their slots died with
+            // the VM and must be forgotten, not released.
             unsafe {
                 (*this).stream.with_mut(|s| s.close());
-                drop(bun_core::heap::take(this));
+                let boxed = bun_core::heap::take(this);
+                // Gate closed ⇒ the owning VM is being (or has been) torn
+                // down — the handle slots die with its heap and must be
+                // forgotten, not released (this can run on a pool thread or
+                // on the worker thread mid-teardown).
+                if boxed.vm.with(|_| ()).is_none() {
+                    let _ = core::mem::ManuallyDrop::new(boxed.this_value.replace(Default::default()));
+                    let _ = core::mem::ManuallyDrop::new(boxed.poll_ref.replace(Default::default()));
+                }
+                drop(boxed);
             }
         }
     }

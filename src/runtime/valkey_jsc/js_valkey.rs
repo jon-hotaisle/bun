@@ -1541,6 +1541,11 @@ impl JSValkeyClient {
                     Holder::run(p.cast::<Holder>());
                     Ok(())
                 },
+                // Queue-owned box, deliberately not freed at teardown: its
+                // client ref cannot be released post-teardown (single-thread
+                // refcount whose zero path touches JSC). Known leak at
+                // worker terminate with a subscription hop in flight.
+                dispose: None,
             };
         }
 
