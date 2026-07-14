@@ -1008,10 +1008,11 @@ impl VirtualMachine {
     pub fn cross_thread_handle(&self) -> crate::vm_handle::VMHandle {
         crate::vm_handle::VMHandle::new(
             NonNull::from(self),
-            self.handle_gate
-                .as_ref()
-                .expect("cross_thread_handle after destroy()")
-                .clone(),
+            std::sync::Arc::clone(
+                self.handle_gate
+                    .as_ref()
+                    .expect("cross_thread_handle after destroy()"),
+            ),
         )
     }
 

@@ -21,10 +21,11 @@ pub struct VMHandle {
 }
 
 // SAFETY: the raw VM pointer is only dereferenced inside `with()` while the
-// gate is held open; `WebWorker::shutdown` close_and_wait()s the gate before
-// the allocation is freed. `VirtualMachine` is `Sync` (single-JS-thread
-// invariant covers all `&VirtualMachine` uses reachable from `with`).
+// gate is held open; teardown close_and_wait()s the gate before the
+// allocation is freed.
 unsafe impl Send for VMHandle {}
+// SAFETY: same gate protocol as `Send`; `VirtualMachine`'s single-JS-thread
+// invariant covers all `&VirtualMachine` uses reachable from `with()`.
 unsafe impl Sync for VMHandle {}
 
 impl VMHandle {
