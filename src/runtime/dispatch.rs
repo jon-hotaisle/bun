@@ -1169,14 +1169,14 @@ pub(crate) fn __bun_release_task_at_shutdown(task: bun_event_loop::Task) -> bool
         // cannot free the tasklet under it.
         task_tag::FetchTasklet => {
             let tasklet = task.ptr.cast::<FetchTasklet>();
-            // Un-stick the schedule flag first (while our ref keeps the
-            // tasklet alive): the next HTTP-thread callback can then win the
-            // CAS, observe the closed gate, and abort the transfer.
+            // No JS-side consumer remains: abort the transfer now. The flag
+            // this entry left set steers later HTTP-thread callbacks onto the
+            // CAS-fail path, whose single `is_done` deref balances the refs
+            // (the double-deref branch would over-release — this entry's ref
+            // is dropped just below).
             // SAFETY: `task.ptr` is the live heap `FetchTasklet`; the ref this
-            // queued entry owns is released just below.
-            unsafe { &*tasklet }
-                .has_schedule_callback
-                .store(false, core::sync::atomic::Ordering::Release);
+            // queued entry owns is released just below, on this (JS) thread.
+            unsafe { (*tasklet).abort_task() };
             FetchTasklet::deref(tasklet);
             true
         }
