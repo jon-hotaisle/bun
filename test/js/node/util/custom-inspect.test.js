@@ -325,9 +325,7 @@ describe("Web Streams [nodejs.util.inspect.custom]", () => {
     expect(() => instance[customSymbol].call()).toThrow(
       expect.objectContaining({ code: "ERR_INVALID_THIS", name: "TypeError" }),
     );
-    expect(() => instance[customSymbol].call({}, 2, {})).toThrow(
-      expect.objectContaining({ code: "ERR_INVALID_THIS" }),
-    );
+    expect(() => instance[customSymbol].call({}, 2, {})).toThrow(expect.objectContaining({ code: "ERR_INVALID_THIS" }));
     // The prototype hosting the method is never passed to it, so inspecting it
     // formats as a plain object instead of throwing.
     expect(inspect(globalThis[className].prototype)).toContain("encoding: [Getter]");
