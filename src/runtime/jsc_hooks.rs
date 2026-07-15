@@ -1580,11 +1580,19 @@ fn terminate_all_workers_and_wait(timeout_ms: u64) {
 /// `vm` is the live per-thread VM; `runtime_state()` must still be installed.
 /// Must run on the JS thread before JSC teardown.
 unsafe fn abort_pending_transfers(vm: *mut VirtualMachine) {
-    // SAFETY: `vm` per fn contract (JS thread, pre-teardown).
-    let list = core::mem::take(&mut *unsafe { &(*vm).terminate_abort_registry }.borrow_mut());
-    for (ctx, abort) in list {
-        // SAFETY: registered entries keep their ctx live until unregistered.
-        unsafe { abort(ctx) };
+    // Loop until the registry stays empty: an abort can run user JS (fetch's
+    // sink cancel) that starts new transfers, which must be aborted too or
+    // their pins would stall the gate close on a slow server.
+    loop {
+        // SAFETY: `vm` per fn contract (JS thread, pre-teardown).
+        let list = core::mem::take(&mut *unsafe { &(*vm).terminate_abort_registry }.borrow_mut());
+        if list.is_empty() {
+            return;
+        }
+        for (ctx, abort) in list {
+            // SAFETY: registered entries keep their ctx live until unregistered.
+            unsafe { abort(ctx) };
+        }
     }
 }
 
