@@ -609,9 +609,7 @@ impl<Op: PasswordOp> PasswordJob<Op> {
                 PasswordResult::<Op>::release_unrun,
             );
         }
-        // On success, ownership of `result` transfers to the event loop; on
-        // `false` (worker VM destroyed) it is leaked per the
-        // `VMHandle::enqueue_task_concurrent` policy.
+        // Ownership of `result` transfers to the event loop.
         let vm = self.vm.clone();
         let pin = self.vm_pin.take().expect("pin taken at create");
         vm.enqueue_task_concurrent_pinned(&pin, || {

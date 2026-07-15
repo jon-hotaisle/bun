@@ -1020,11 +1020,9 @@ macro_rules! __impl_compression_stream {
                 unsafe { ::bun_core::from_field_ptr!(Self, task, task) }
             }
 
-            // All three `Native*` structs `#[derive(bun_ptr::ThreadSafeRefCounted)]`
-            // (atomic: the JS wrapper's finalizer and a work-pool completion
-            // can release refs from different threads at worker terminate)
-            // with their own `#[ref_count(destroy = …)]` — delegate so the
-            // macro doesn't hard-code a destroy signature.
+            // All three `Native*` structs derive an intrusive refcount with
+            // their own `#[ref_count(destroy = …)]` — delegate so the macro
+            // doesn't hard-code a destroy signature.
             #[inline] fn ref_(&self) {
                 // SAFETY: `self` is a live borrow of the heap m_ctx payload.
                 unsafe {

@@ -183,10 +183,8 @@ impl Default for S3HttpSimpleTask {
 // Re-export the canonical alias so sibling modules that imported it from here keep compiling.
 pub use bun_jsc::JsTerminatedResult;
 
-/// Dispose for callback contexts that own nothing the task must free
-/// (e.g. independently-refcounted `MultiPartUpload`).
-/// Terminate-drain release for callback ctxs owned elsewhere (independently
-/// refcounted JS-thread objects): nothing to free from the drain.
+/// Terminate-drain release for callback ctxs owned elsewhere (nothing for
+/// the drain to free — the owner releases on its own lifecycle).
 pub(crate) unsafe fn noop_context_release(_: *mut c_void) {}
 
 pub enum Callback {

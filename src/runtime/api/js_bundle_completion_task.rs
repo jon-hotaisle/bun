@@ -806,9 +806,10 @@ static COMPLETION_VTABLE: dispatch::CompletionDispatch = dispatch::CompletionDis
             unsafe { core::ptr::NonNull::new_unchecked(task) }
         });
         if !queued {
-            // Owning VM destroyed mid-bundle (plugin build, unpinned): drop
-            // the item; the run's final `complete_on_bundle_thread` frees the
-            // completion when its own enqueue fails.
+            // Worker terminated during an unpinned plugin build: dropping
+            // the item strands `pending_items`, so the run never drains and
+            // the BundleThread wedges; the completion leaks with it
+            // (documented residual — see `begin_run`'s FIXME).
             // SAFETY: the queue never took the item; sole owner here.
             drop(unsafe { bun_core::heap::take(task) });
         }
