@@ -69,15 +69,17 @@ mod _impl {
     // R-2 (host-fn re-entrancy): every JS-exposed method takes `&self`; per-field
     // interior mutability via `Cell` (Copy) / `JsCell` (non-Copy).
     #[bun_jsc::JsClass]
-    #[derive(bun_ptr::ThreadSafeRefCounted)]
+    #[derive(bun_ptr::CellRefCounted)]
     #[ref_count(destroy = Self::destroy_on_zero)]
     pub struct NativeBrotli {
-        pub ref_count: bun_ptr::ThreadSafeRefCount<NativeBrotli>,
+        pub ref_count: Cell<u32>,
         // JSC_BORROW backref; global outlives this m_ctx payload. `BackRef`
         // centralises the single unsafe deref so the trait impl is safe.
         pub global_this: bun_ptr::BackRef<JSGlobalObject>,
         /// Cross-thread handle to the owning VM; see `VMHandle`.
         pub vm: bun_jsc::vm_handle::VMHandle,
+        /// Per-write shutdown-gate pin (see `CompressionStreamImpl::vm_pin`).
+        pub vm_pin: JsCell<Option<bun_threading::GateGuest>>,
         pub stream: JsCell<Context>,
         pub poll_ref: JsCell<CountedKeepAlive>,
         // TODO: Strong self-ref on the wrapper → JsRef per PORTING.md §JSC (Strong back-ref to own wrapper leaks)
@@ -139,10 +141,11 @@ mod _impl {
                 ..Default::default()
             };
             Ok(Box::new(Self {
-                ref_count: bun_ptr::ThreadSafeRefCount::init(),
+                ref_count: Cell::new(1),
                 // JSC_BORROW backref — the global outlives this m_ctx payload.
                 global_this: bun_ptr::BackRef::new(global_this),
                 vm: global_this.bun_vm().cross_thread_handle(),
+                vm_pin: JsCell::new(None),
                 stream: JsCell::new(stream),
                 poll_ref: JsCell::new(CountedKeepAlive::default()),
                 this_value: JsCell::new(StrongOptional::empty()),
@@ -296,25 +299,10 @@ mod _impl {
         /// Safe fn: only reachable via the `#[ref_count(destroy = …)]` derive,
         /// whose generated trait `destroy` upholds the sole-owner contract.
         fn destroy_on_zero(this: *mut Self) {
-            // Gate closed ⇒ owning VM torn down: drop inside the dead-VM
-            // scope so the handle slots and loop ref are forgotten, not
-            // released (see NativeZlib::deinit); brotli state still closes.
-            // SAFETY: refcount hit zero ⇒ sole owner; Box from `constructor`.
-            unsafe {
-                if (*this).vm.with(|_| ()).is_none() {
-                    let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
-                    (*this).stream.with_mut(|s| match s.mode {
-                        bun_zlib::NodeMode::BROTLI_ENCODE | bun_zlib::NodeMode::BROTLI_DECODE => {
-                            s.close();
-                        }
-                        _ => {}
-                    });
-                    drop(bun_core::heap::take(this));
-                    return;
-                }
-                (*this).deinit();
-                drop(bun_core::heap::take(this));
-            }
+            // SAFETY: refcount hit zero ⇒ no other borrow remains.
+            unsafe { (*this).deinit() };
+            // SAFETY: allocated via `Box::new` in `constructor`.
+            drop(unsafe { bun_core::heap::take(this) });
         }
 
         /// RefCount destructor body (called when ref_count → 0).

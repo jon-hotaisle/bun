@@ -53,6 +53,14 @@ impl ShutdownGate {
         }
     }
 
+    /// Set the CLOSED bit without waiting for guests. Only sound when the
+    /// protected memory is never actually freed (the main VM's box lives for
+    /// the process) — new guests are refused, in-flight ones finish on their
+    /// own time.
+    pub fn close_without_waiting(&self) {
+        self.state.fetch_or(CLOSED, Ordering::AcqRel);
+    }
+
     /// Close the gate and block until every guest has left. After this
     /// returns, no guest is inside and none can enter; the protected memory
     /// may be freed. Idempotent; must never be called from a guest section.

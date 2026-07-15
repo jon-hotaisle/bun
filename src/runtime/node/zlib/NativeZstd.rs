@@ -34,16 +34,18 @@ mod _impl {
     // `host_fn_this` shim still passes `&mut NativeZstd` — `&mut T` auto-reborrows
     // to `&T` so the impls below compile against either.
     #[bun_jsc::JsClass]
-    #[derive(bun_ptr::ThreadSafeRefCounted)]
+    #[derive(bun_ptr::CellRefCounted)]
     #[ref_count(destroy = Self::destroy_on_zero)]
     pub struct NativeZstd {
         // Intrusive single-thread refcount.
-        pub ref_count: bun_ptr::ThreadSafeRefCount<NativeZstd>,
+        pub ref_count: Cell<u32>,
         // LIFETIMES.tsv: JSC_BORROW. The global outlives this m_ctx payload;
         // `BackRef` centralises the single unsafe deref so the trait impl is safe.
         pub global_this: bun_ptr::BackRef<JSGlobalObject>,
         /// Cross-thread handle to the owning VM; see `VMHandle`.
         pub vm: bun_jsc::vm_handle::VMHandle,
+        /// Per-write shutdown-gate pin (see `CompressionStreamImpl::vm_pin`).
+        pub vm_pin: JsCell<Option<bun_threading::GateGuest>>,
         pub stream: JsCell<Context>,
         pub poll_ref: JsCell<CountedKeepAlive>,
         pub this_value: JsCell<StrongOptional>, // jsc.Strong.Optional
@@ -105,11 +107,12 @@ mod _impl {
                 ..Default::default()
             };
             Ok(Box::new(Self {
-                ref_count: bun_ptr::ThreadSafeRefCount::init(),
+                ref_count: Cell::new(1),
                 // JSC_BORROW — the JSGlobalObject outlives this payload (the C++
                 // wrapper is owned by that global's heap).
                 global_this: bun_ptr::BackRef::new(global),
                 vm: global.bun_vm().cross_thread_handle(),
+                vm_pin: JsCell::new(None),
                 stream: JsCell::new(stream),
                 poll_ref: JsCell::new(CountedKeepAlive::default()),
                 this_value: JsCell::new(StrongOptional::empty()),
@@ -283,10 +286,6 @@ mod _impl {
         fn destroy_on_zero(this: *mut Self) {
             // SAFETY: refcount hit zero ⇒ sole owner; Box from `constructor`.
             unsafe {
-                // Gate closed ⇒ owning VM torn down: drop inside the dead-VM
-                // scope (see NativeZlib::deinit).
-                let _scope = ((*this).vm.with(|_| ()).is_none())
-                    .then(bun_core::dead_vm_scope::DeadVmDisposalScope::enter);
                 drop(bun_core::heap::take(this));
             }
         }

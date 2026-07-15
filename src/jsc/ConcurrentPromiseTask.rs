@@ -17,11 +17,6 @@ pub trait ConcurrentPromiseTaskContext: Sized {
 
     fn run(&mut self);
     fn then(&mut self, promise: &mut JSPromise) -> Result<(), JsTerminated>;
-
-    /// Release resources with no drop glue (raw fds, refcounts without
-    /// `Drop`) before the dead-VM disposal drop; handle slots and protect
-    /// pins are forgotten by the scope. Default: nothing extra.
-    fn dispose_extras_for_dead_vm(&mut self) {}
 }
 
 /// A generic task that runs work on a thread pool and resolves a JavaScript Promise with the result.
@@ -37,6 +32,9 @@ pub struct ConcurrentPromiseTask<'a, Context: ConcurrentPromiseTaskContext> {
     pub task: WorkPoolTask,
     /// Cross-thread handle to the owning VM; see [`VMHandle`].
     pub vm: VMHandle,
+    /// Holds the worker's shutdown gate open until the completion is
+    /// enqueued (dropped on the pool thread in `on_finish`).
+    pub vm_pin: Option<bun_threading::GateGuest>,
     pub promise: JSPromiseStrong,
     pub global_this: &'a JSGlobalObject,
     pub concurrent_task: ConcurrentTask,
@@ -58,25 +56,13 @@ impl<Context: ConcurrentPromiseTaskContext> Taskable for ConcurrentPromiseTask<'
     const TAG: TaskTag = Context::TASK_TAG;
 }
 
-// SAFETY: plain drop in the dead-VM scope, after the ctx releases its
-// non-Drop resources.
-unsafe impl<Context: ConcurrentPromiseTaskContext> crate::vm_handle::DisposeAfterVmDestroyed
-    for ConcurrentPromiseTask<'_, Context>
-{
-    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
-        // SAFETY: sole owner per the trait contract.
-        unsafe {
-            (*this).ctx.dispose_extras_for_dead_vm();
-            drop(bun_core::heap::take(this));
-        }
-    }
-}
-
 impl<'a, Context: ConcurrentPromiseTaskContext> ConcurrentPromiseTask<'a, Context> {
     pub fn create_on_js_thread(global_this: &'a JSGlobalObject, value: Box<Context>) -> Box<Self> {
+        let vm = VirtualMachine::get().cross_thread_handle();
+        let vm_pin = Some(vm.pin());
         let mut this = Box::new(Self {
-            vm: VirtualMachine::get().cross_thread_handle(),
+            vm,
+            vm_pin,
             ctx: value,
             task: WorkPoolTask {
                 node: Default::default(),
@@ -124,9 +110,11 @@ impl<'a, Context: ConcurrentPromiseTaskContext> ConcurrentPromiseTask<'a, Contex
         // the pointer (does not dereference it).
         let this_ref = unsafe { &mut *this };
         let vm = this_ref.vm.clone();
-        // On `false` (worker VM destroyed) the job is leaked per the
-        // `VMHandle::enqueue_task_concurrent` policy.
-        let _ = vm.enqueue_intrusive(&mut this_ref.concurrent_task, this);
+        let pin = this_ref.vm_pin.take().expect("pin taken at create");
+        vm.enqueue_intrusive_pinned(&pin, &mut this_ref.concurrent_task, this);
+        // Completion enqueued: releasing the pin lets terminate proceed to
+        // drain it on the (still alive) VM.
+        drop(pin);
     }
 
     /// Frees the heap allocation backing this task.

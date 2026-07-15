@@ -37,7 +37,7 @@ use bun_options_types::schema::api;
 // interior mutability via `JsCell` (= `UnsafeCell` projector). `JsCell` is
 // `#[repr(transparent)]`, so field offsets are unchanged.
 #[bun_jsc::JsClass(name = "Transpiler")]
-#[derive(bun_ptr::ThreadSafeRefCounted)]
+#[derive(bun_ptr::RefCounted)]
 pub struct JSTranspiler {
     pub transpiler: JsCell<Transpiler::Transpiler<'static>>,
     /// Read-only after construction EXCEPT for `config.log`, which is the
@@ -51,10 +51,10 @@ pub struct JSTranspiler {
     // address is stable across the move into `Box<JSTranspiler>` —
     // `transpiler.arena` holds a `&'static Arena` pointing into it.
     pub arena: Box<Arena>,
-    // Intrusive refcount field for `bun_ptr::IntrusiveRc<JSTranspiler>`.
-    // Atomic: the JS wrapper's finalizer and a work-pool transform task can
-    // release their refs from different threads at worker terminate.
-    pub ref_count: bun_ptr::ThreadSafeRefCount<JSTranspiler>,
+    // Intrusive refcount field for `bun_ptr::IntrusiveRc<JSTranspiler>`:
+    // single-thread intrusive `bun.ptr.RefCount` because `*JSTranspiler`
+    // crosses FFI as `m_ctx` (per PORTING.md §Pointers; not `Arc`).
+    pub ref_count: bun_ptr::RefCount<JSTranspiler>,
 }
 
 fn default_transform_options() -> api::TransformOptions {
@@ -682,11 +682,6 @@ pub(crate) type AsyncTransformTask<'a> =
 impl<'a> jsc::concurrent_promise_task::ConcurrentPromiseTaskContext for TransformTask<'a> {
     const TASK_TAG: bun_event_loop::TaskTag = bun_event_loop::task_tag::AsyncTransformTask;
 
-    fn dispose_extras_for_dead_vm(&mut self) {
-        // `BunString` has no drop glue: release the WTF ref on the output.
-        // (`js_instance` is released by `Drop for TransformTask`.)
-        core::mem::take(&mut self.output_code).deref();
-    }
     fn run(&mut self) {
         TransformTask::run(self)
     }
@@ -1045,7 +1040,7 @@ impl JSTranspiler {
             scan_pass_result: JsCell::new(ScanPassResult::init()),
             buffer_writer: JsCell::new(None),
             log_level: bun_ast::Level::Err,
-            ref_count: bun_ptr::ThreadSafeRefCount::init(),
+            ref_count: bun_ptr::RefCount::init(),
         });
         // errdefer past this point → `this: Box<_>` drops and runs Drop for JSTranspiler.
 

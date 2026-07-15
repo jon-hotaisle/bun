@@ -35,15 +35,17 @@ mod _impl {
     /// `ref`/`deref` are provided by `bun_ptr::IntrusiveRc<NativeZlib>`; when the count hits
     /// zero it invokes [`NativeZlib::deinit`].
     #[bun_jsc::JsClass]
-    #[derive(bun_ptr::ThreadSafeRefCounted)]
+    #[derive(bun_ptr::CellRefCounted)]
     #[ref_count(destroy = Self::deinit)]
     pub struct NativeZlib {
-        pub ref_count: bun_ptr::ThreadSafeRefCount<NativeZlib>,
+        pub ref_count: Cell<u32>,
         // JSC_BORROW backref; global outlives this m_ctx payload. `BackRef`
         // centralises the single unsafe deref so the trait impl is safe.
         pub global_this: bun_ptr::BackRef<JSGlobalObject>,
         /// Cross-thread handle to the owning VM; see `VMHandle`.
         pub vm: bun_jsc::vm_handle::VMHandle,
+        /// Per-write shutdown-gate pin (see `CompressionStreamImpl::vm_pin`).
+        pub vm_pin: JsCell<Option<bun_threading::GateGuest>>,
         pub stream: JsCell<Context>,
         pub poll_ref: JsCell<CountedKeepAlive>,
         pub this_value: JsCell<StrongOptional>, // jsc.Strong.Optional
@@ -93,10 +95,11 @@ mod _impl {
                 ..Default::default()
             };
             Ok(Box::new(Self {
-                ref_count: bun_ptr::ThreadSafeRefCount::init(),
+                ref_count: Cell::new(1),
                 // JSC_BORROW backref — the global outlives this m_ctx payload.
                 global_this: bun_ptr::BackRef::new(global),
                 vm: global.bun_vm().cross_thread_handle(),
+                vm_pin: JsCell::new(None),
                 stream: JsCell::new(stream),
                 poll_ref: JsCell::new(CountedKeepAlive::default()),
                 this_value: JsCell::new(StrongOptional::empty()),
@@ -265,11 +268,6 @@ mod _impl {
             // the VM and must be forgotten, not released.
             unsafe {
                 (*this).stream.with_mut(|s| s.close());
-                // Gate closed ⇒ the owning VM is being (or has been) torn
-                // down: drop inside the dead-VM scope so the handle slots and
-                // loop ref are forgotten, not released.
-                let _scope = ((*this).vm.with(|_| ()).is_none())
-                    .then(bun_core::dead_vm_scope::DeadVmDisposalScope::enter);
                 drop(bun_core::heap::take(this));
             }
         }

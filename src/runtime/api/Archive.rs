@@ -685,6 +685,9 @@ pub struct AsyncTask<C: TaskContext> {
     promise: JSPromiseStrong,
     /// Cross-thread handle to the owning VM; see [`VMHandle`].
     vm: VMHandle,
+    /// Holds the worker's shutdown gate open until the completion is
+    /// enqueued (dropped on the pool thread).
+    vm_pin: Option<bun_threading::GateGuest>,
     task: WorkPoolTask,
     concurrent_task: ConcurrentTask,
     keep_alive: KeepAlive,
@@ -694,16 +697,15 @@ impl<C: TaskContext> Taskable for AsyncTask<C> {
     const TAG: TaskTag = C::TAG;
 }
 
-// SAFETY: plain drop in the dead-VM scope — every ctx variant owns only
-// process-heap data; the promise slot is forgotten by the scope.
-unsafe impl<C: TaskContext> bun_jsc::vm_handle::DisposeAfterVmDestroyed for AsyncTask<C> {}
-
 impl<C: TaskContext> AsyncTask<C> {
     fn create(global: &JSGlobalObject, ctx: C) -> Result<*mut Self, bun_alloc::AllocError> {
+        let vm = global.bun_vm().cross_thread_handle();
+        let vm_pin = Some(vm.pin());
         let this = Box::new(AsyncTask {
             ctx,
             promise: JSPromiseStrong::init(global),
-            vm: global.bun_vm().cross_thread_handle(),
+            vm,
+            vm_pin,
             task: WorkPoolTask {
                 callback: Self::run_callback,
                 node: Default::default(),
@@ -747,12 +749,25 @@ impl<C: TaskContext> AsyncTask<C> {
         let this: *mut Self = unsafe { bun_core::from_field_ptr!(Self, task, work_task) };
         // SAFETY: thread-pool has exclusive access to ctx until it enqueues the concurrent task.
         unsafe { (*this).ctx.run() };
-        // SAFETY: `this` is the live heap task; on `false` (worker VM
-        // destroyed) it is leaked per the VMHandle enqueue policy.
+        // SAFETY: `this` is the live heap task; the pin (held since create)
+        // admits the enqueue even while terminate is draining.
         unsafe {
             let vm = (*this).vm.clone();
-            let _ = vm.enqueue_intrusive(&mut (*this).concurrent_task, this);
+            let pin = (*this).vm_pin.take().expect("pin taken at create");
+            vm.enqueue_intrusive_pinned(&pin, &mut (*this).concurrent_task, this);
+            drop(pin);
         }
+    }
+
+    /// Reclaim a queued-but-unrun completion during the terminate drain
+    /// (JS thread, VM alive): plain drop releases everything.
+    ///
+    /// # Safety
+    /// `this` is the queue-owned heap task popped by the drain.
+    pub unsafe fn release_unrun(this: *mut Self) {
+        // SAFETY: caller contract.
+        let mut owned = unsafe { bun_core::heap::take(this) };
+        owned.keep_alive.unref(bun_io::js_vm_ctx());
     }
 
     /// # Safety

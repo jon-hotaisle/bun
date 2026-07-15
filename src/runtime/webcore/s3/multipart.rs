@@ -187,6 +187,16 @@ impl MultiPartUpload {
     #[inline]
     // Forwards `this` to the derived intrusive-rc decrement without dereferencing it here;
     // not_unsafe_ptr_arg_deref is a false positive on opaque-token forwarding.
+    /// Terminate-drain release for a queued-but-unrun response whose ctx is
+    /// the upload itself: drops the request-held ref the JS callback would
+    /// have dropped (JS thread, VM alive).
+    ///
+    /// # Safety
+    /// `ctx` is the live `MultiPartUpload` registered as callback context.
+    pub(crate) unsafe fn release_unrun_ctx(ctx: *mut core::ffi::c_void) {
+        Self::deref_(ctx.cast::<Self>());
+    }
+
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn deref_(this: *mut Self) {
         // SAFETY: per fn contract — forwarded to the derived intrusive-rc decrement.
@@ -222,6 +232,17 @@ pub struct UploadPartResult {
 }
 
 impl UploadPart {
+    /// Terminate-drain release for a queued-but-unrun part response: drops
+    /// the ctx ref taken in `start()` (JS thread, VM alive). The part itself
+    /// stays owned by the upload's queue.
+    ///
+    /// # Safety
+    /// `part` is the live `UploadPart` registered as callback context.
+    pub(crate) unsafe fn release_unrun_part_ctx(part: *mut core::ffi::c_void) {
+        // SAFETY: caller contract; the BackRef target outlives the part.
+        MultiPartUpload::deref_(unsafe { (*part.cast::<Self>()).ctx.as_ptr() });
+    }
+
     fn free_allocated_slice(&mut self) {
         if self.allocated_size > 0 {
             // SAFETY: `data.ptr` was allocated by the global allocator with capacity == allocated_size
@@ -363,7 +384,7 @@ impl UploadPart {
             },
             s3_simple_request::S3Callback::Part(Self::on_part_response),
             callback_context,
-            crate::webcore::s3::simple_request::noop_context_dispose,
+            UploadPart::release_unrun_part_ctx,
         )
     }
 
@@ -450,7 +471,7 @@ impl MultiPartUpload {
                         },
                         s3_simple_request::S3Callback::Upload(Self::single_send_upload_response),
                         callback_context,
-                        crate::webcore::s3::simple_request::noop_context_dispose,
+                        MultiPartUpload::release_unrun_ctx,
                     )?;
 
                     Ok(())
@@ -833,7 +854,7 @@ impl MultiPartUpload {
             },
             s3_simple_request::S3Callback::Commit(Self::on_commit_multi_part_request),
             callback_context,
-            crate::webcore::s3::simple_request::noop_context_dispose,
+            MultiPartUpload::release_unrun_ctx,
         )
     }
 
@@ -865,7 +886,7 @@ impl MultiPartUpload {
             },
             s3_simple_request::S3Callback::Upload(Self::on_rollback_multi_part_request),
             callback_context,
-            crate::webcore::s3::simple_request::noop_context_dispose,
+            MultiPartUpload::release_unrun_ctx,
         )
     }
 
@@ -902,7 +923,7 @@ impl MultiPartUpload {
                 },
                 s3_simple_request::S3Callback::Download(Self::start_multi_part_request_result),
                 callback_context,
-                crate::webcore::s3::simple_request::noop_context_dispose,
+                MultiPartUpload::release_unrun_ctx,
             )?;
         } else if self.state == State::MultipartCompleted {
             // SAFETY: part points into self.queue which is live; reborrow disjoint from self fields used above
@@ -1045,7 +1066,7 @@ impl MultiPartUpload {
                 },
                 s3_simple_request::S3Callback::Upload(Self::single_send_upload_response),
                 callback_context,
-                crate::webcore::s3::simple_request::noop_context_dispose,
+                MultiPartUpload::release_unrun_ctx,
             ); // TODO: properly propagate exception upwards
         } else {
             // we need to split

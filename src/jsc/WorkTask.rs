@@ -29,17 +29,6 @@ pub trait WorkTaskContext: Sized {
     /// because the context is heap-allocated, crosses threads, and is mutated.
     fn run(this: *mut Self, task: *mut WorkTask<Self>);
     fn then(this: *mut Self, global_this: &JSGlobalObject) -> Result<(), crate::JsTerminated>;
-
-    /// Free the heap context after its owning VM was destroyed. Runs inside
-    /// the dead-VM disposal scope (handle slots and pins are forgotten);
-    /// override only to release non-Drop resources first. Default: drop.
-    ///
-    /// # Safety
-    /// `this` is live and exclusively owned; the owning VM is gone.
-    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        // SAFETY: forwarded caller contract — sole owner of a heap ctx.
-        drop(unsafe { bun_core::heap::take(this) });
-    }
 }
 
 pub struct WorkTask<Context: WorkTaskContext> {
@@ -47,6 +36,9 @@ pub struct WorkTask<Context: WorkTaskContext> {
     pub task: WorkPoolTask,
     /// Cross-thread handle to the owning VM; see [`VMHandle`].
     pub vm: VMHandle,
+    /// Holds the worker's shutdown gate open until the completion is
+    /// enqueued (dropped on the pool thread in `on_finish`).
+    pub vm_pin: Option<bun_threading::GateGuest>,
     // allocator field dropped — global mimalloc (see PORTING.md §Allocators)
     pub global_this: BackRef<JSGlobalObject>,
     pub concurrent_task: ConcurrentTask,
@@ -68,25 +60,14 @@ impl<Context: WorkTaskContext> Taskable for WorkTask<Context> {
     const TAG: TaskTag = Context::TASK_TAG;
 }
 
-// SAFETY: shell fields have no entangled drop glue; the heap ctx is freed
-// via its own dispose, all inside the dead-VM scope.
-unsafe impl<Context: WorkTaskContext> crate::vm_handle::DisposeAfterVmDestroyed
-    for WorkTask<Context>
-{
-    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
-        // SAFETY: sole owner per the trait contract.
-        let task = *unsafe { bun_core::heap::take(this) };
-        // SAFETY: `ctx` is the live context passed to `create_on_js_thread`.
-        unsafe { Context::dispose_after_vm_destroyed(task.ctx) };
-    }
-}
-
 impl<Context: WorkTaskContext> WorkTask<Context> {
     pub fn create_on_js_thread(global_this: &JSGlobalObject, value: *mut Context) -> *mut Self {
         let vm = global_this.bun_vm().as_mut();
+        let handle = vm.cross_thread_handle();
+        let vm_pin = Some(handle.pin());
         let mut this = Box::new(Self {
-            vm: vm.cross_thread_handle(),
+            vm: handle,
+            vm_pin,
             ctx: value,
             global_this: BackRef::new(global_this),
             task: WorkPoolTask {
@@ -154,8 +135,8 @@ impl<Context: WorkTaskContext> WorkTask<Context> {
         // stores the pointer (does not dereference it).
         let vm = this.vm.clone();
         let this_ptr: *mut Self = this;
-        // On `false` (worker VM destroyed) `this`/`ctx` are leaked per the
-        // `VMHandle::enqueue_task_concurrent` policy.
-        let _ = vm.enqueue_intrusive(&mut this.concurrent_task, this_ptr);
+        let pin = this.vm_pin.take().expect("pin taken at create");
+        vm.enqueue_intrusive_pinned(&pin, &mut this.concurrent_task, this_ptr);
+        drop(pin);
     }
 }

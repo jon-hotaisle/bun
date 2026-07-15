@@ -18,10 +18,10 @@ pub type JsResult<T> = core::result::Result<T, ErasedJsError>;
 pub struct AnyTask {
     pub ctx: Option<NonNull<c_void>>,
     pub callback: fn(*mut c_void) -> JsResult<()>,
-    /// Frees `ctx` when the owning worker VM is torn down before the task
-    /// could run (worker terminate). `None` ⇒ the ctx is owned elsewhere and
-    /// must not be freed from the queue.
-    pub dispose: Option<unsafe fn(*mut c_void)>,
+    /// Releases a queue-owned `ctx` when the task is reclaimed unrun by the
+    /// worker-terminate drain (JS thread, VM alive — plain drop suffices).
+    /// `None` ⇒ the ctx is owned elsewhere and must not be freed here.
+    pub dispose: Option<fn(*mut c_void)>,
 }
 
 impl Default for AnyTask {
@@ -79,13 +79,12 @@ impl AnyTask {
     pub fn from_typed_with_dispose<T>(
         ctx: *mut T,
         callback: fn(*mut T) -> JsResult<()>,
-        dispose: unsafe fn(*mut T),
+        dispose: fn(*mut T),
     ) -> Self {
         let mut task = Self::from_typed(ctx, callback);
         // SAFETY: same ABI argument as `from_typed`'s callback transmute.
-        task.dispose = Some(unsafe {
-            core::mem::transmute::<unsafe fn(*mut T), unsafe fn(*mut c_void)>(dispose)
-        });
+        task.dispose =
+            Some(unsafe { core::mem::transmute::<fn(*mut T), fn(*mut c_void)>(dispose) });
         task
     }
 }

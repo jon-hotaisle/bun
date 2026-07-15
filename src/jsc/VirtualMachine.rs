@@ -285,10 +285,13 @@ pub struct VirtualMachine {
     /// VM box is freed.
     pub handle_gate: Option<std::sync::Arc<bun_threading::ShutdownGate>>,
 
-    /// In-flight `fetch()` tasklets (JS-thread only). Each entry holds a ref
-    /// on the tasklet; worker shutdown walks this to detach JSC handles and
-    /// abort transfers while the VM is still alive. Erased `*mut FetchTasklet`.
-    pub live_fetch_tasklets: core::cell::RefCell<Vec<*mut core::ffi::c_void>>,
+    /// In-flight abortable transfers (JS-thread only): `(ctx, abort_fn)`.
+    /// Worker terminate / process exit walks this so the HTTP side finishes
+    /// promptly and its producer pins drop. Producers register at creation
+    /// and unregister (by ctx) when the JS side consumes the completion.
+    pub terminate_abort_registry: core::cell::RefCell<
+        Vec<(*mut core::ffi::c_void, unsafe fn(*mut core::ffi::c_void))>,
+    >,
 
     pub ref_strings: crate::ref_string::Map,
     pub ref_strings_mutex: bun_threading::Mutex,
@@ -1000,6 +1003,17 @@ impl VirtualMachine {
     /// Refuse new cross-thread [`crate::vm_handle::VMHandle`] guests and wait
     /// out any guest currently inside `with()`. Must precede the final queue
     /// drain and any teardown of memory those guests touch; idempotent.
+    /// Remove a `terminate_abort_registry` entry by ctx pointer (JS thread).
+    /// Returns `false` if the walk already consumed it.
+    pub fn unregister_terminate_abort(&self, ctx: *mut core::ffi::c_void) -> bool {
+        let mut list = self.terminate_abort_registry.borrow_mut();
+        let Some(i) = list.iter().position(|&(p, _)| p == ctx) else {
+            return false;
+        };
+        list.swap_remove(i);
+        true
+    }
+
     pub fn close_cross_thread_gate(&self) {
         self.handle_gate
             .as_ref()
@@ -1626,7 +1640,7 @@ impl VirtualMachine {
             // derefs below can reach zero and route through the drain.
             if let Some(hooks) = runtime_hooks() {
                 // SAFETY: live per-thread VM on the JS thread, pre-teardown.
-                unsafe { (hooks.detach_fetch_tasklets)(core::ptr::from_mut(self)) };
+                unsafe { (hooks.abort_pending_transfers)(core::ptr::from_mut(self)) };
             }
 
             // The HTTP daemon thread holds a `Box<ThreadlocalAsyncHTTP>` per
@@ -1859,13 +1873,13 @@ pub struct RuntimeHooks {
     /// and the JSC heap must not have been swept yet.
     pub cancel_all_timers: unsafe fn(vm: *mut VirtualMachine),
 
-    /// Worker-shutdown walk over `vm.live_fetch_tasklets`: aborts each
-    /// transfer and detaches its JSC handles while the VM is still alive, so
-    /// the HTTP thread's last deref can free the box after the gate closes.
+    /// Worker-terminate / process-exit walk over
+    /// `vm.terminate_abort_registry`: aborts each registered transfer while
+    /// the VM is still alive so producer pins drop promptly.
     ///
     /// # Safety
     /// `vm` is the live per-thread VM on its own JS thread, pre-teardown.
-    pub detach_fetch_tasklets: unsafe fn(vm: *mut VirtualMachine),
+    pub abort_pending_transfers: unsafe fn(vm: *mut VirtualMachine),
 }
 
 /// Canonical `EventLoopCtx` vtable for a `*mut VirtualMachine` owner — the JS
@@ -2174,7 +2188,8 @@ impl VirtualMachine {
             let _ = (*regular).tasks.ensure_unused_capacity(64);
             addr_of_mut!((*vm).event_loop).write(regular);
 
-            addr_of_mut!((*vm).live_fetch_tasklets).write(core::cell::RefCell::new(Vec::new()));
+            addr_of_mut!((*vm).terminate_abort_registry)
+                .write(core::cell::RefCell::new(Vec::new()));
             addr_of_mut!((*vm).handle_gate).write(Some(std::sync::Arc::new(
                 bun_threading::ShutdownGate::new(),
             )));
@@ -4499,10 +4514,17 @@ impl VirtualMachine {
     /// Worker-thread teardown.
     pub fn destroy(&mut self) {
         // Backstop for non-worker teardown paths (global_exit, bake): refuse
-        // cross-thread VMHandle guests and wait out any mid-`with()` guest
-        // before the event loop below is deinit'd. Idempotent — worker
-        // shutdown already closed the gate before draining the queue.
-        self.close_cross_thread_gate();
+        // new cross-thread VMHandle guests. Main-VM exit must NOT wait —
+        // a producer pin stranded by an un-acked HTTP park would hang the
+        // process, and the main VM's box is never freed anyway. Worker
+        // shutdown already did the full close-and-wait before its drain.
+        if self.is_main_thread {
+            if let Some(gate) = &self.handle_gate {
+                gate.close_without_waiting();
+            }
+        } else {
+            self.close_cross_thread_gate();
+        }
         drop(self.handle_gate.take());
         self.regular_event_loop.deinit();
         self.macro_event_loop.deinit();

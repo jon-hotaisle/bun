@@ -1274,22 +1274,6 @@ mod _async_tasks {
         const TAG: bun_event_loop::TaskTag = F.task_tag();
     }
 
-    // SAFETY: plain drop in the dead-VM scope, after the result releases its
-    // non-Drop resources (fds, buffer bytes, string refs).
-    unsafe impl<R: FsReturn, A: Unprotect, const F: NodeFSFunctionEnum>
-        bun_jsc::vm_handle::DisposeAfterVmDestroyed for AsyncFSTask<R, A, F>
-    {
-        unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-            let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
-            // SAFETY: caller owns `this` exclusively (Box::leak'd in create()).
-            unsafe {
-                if let Ok(r) = &mut (*this).result {
-                    r.release_for_dead_vm();
-                }
-                drop(bun_core::heap::take(this));
-            }
-        }
-    }
     #[cfg(windows)]
     impl<R, A: Unprotect, const F: NodeFSFunctionEnum> bun_event_loop::Taskable
         for UVFSRequest<R, A, F>
@@ -1304,6 +1288,9 @@ mod _async_tasks {
         pub global_object: bun_ptr::BackRef<JSGlobalObject>,
         /// Cross-thread handle to the owning VM; see `VMHandle`.
         pub vm: bun_jsc::vm_handle::VMHandle,
+        /// Holds the worker's shutdown gate open until the completion is
+        /// enqueued (dropped on the pool thread).
+        pub vm_pin: Option<bun_threading::GateGuest>,
         pub task: WorkPoolTask,
         pub result: Maybe<R>,
         pub r#ref: KeepAlive,
@@ -1346,10 +1333,12 @@ mod _async_tasks {
                 result: Err(sys::Error::default()),
                 global_object: bun_ptr::BackRef::new(global_object),
                 vm: vm.cross_thread_handle(),
+                vm_pin: None,
                 task: work_pool_task(Self::work_pool_callback),
                 r#ref: KeepAlive::default(),
                 tracker: AsyncTaskTracker::init(vm),
             });
+            task.vm_pin = Some(task.vm.pin());
             // KeepAlive::ref_ now takes the type-erased aio EventLoopCtx; the JS
             // event loop is the only one that owns AsyncFSTask/UVFSRequest.
             task.r#ref.ref_(bun_io::js_vm_ctx());
@@ -1368,15 +1357,13 @@ mod _async_tasks {
             // `sys::Error::path` is `Box<[u8]>` boxed at the
             // `errno_sys_p` construction site, so no clone is needed — `node_fs` may drop.
 
-            // On `false` (worker VM destroyed) the task is freed here.
+            // The pin (held since `create`) admits the enqueue even while
+            // terminate is draining; drop it right after.
             let vm = this.vm.clone();
             let this_ptr = std::ptr::from_mut::<Self>(this);
-            if !vm.enqueue_task_concurrent(|| ConcurrentTask::create_from(this_ptr)) {
-                // SAFETY: sole owner — the queue never took the task.
-                unsafe {
-                    <Self as bun_jsc::vm_handle::DisposeAfterVmDestroyed>::dispose_after_vm_destroyed(this_ptr);
-                }
-            }
+            let pin = this.vm_pin.take().expect("pin taken at create");
+            vm.enqueue_task_concurrent_pinned(&pin, || ConcurrentTask::create_from(this_ptr));
+            drop(pin);
         }
 
         pub fn run_from_js_thread(&mut self) -> Result<(), bun_jsc::JsTerminated> {
@@ -2237,6 +2224,9 @@ mod _async_tasks {
         pub global_object: bun_ptr::BackRef<JSGlobalObject>,
         /// Cross-thread handle to the owning VM; see [`VMHandle`].
         pub vm: bun_jsc::vm_handle::VMHandle,
+        /// Holds the worker's shutdown gate open until the completion is
+        /// enqueued (dropped on the pool thread).
+        pub vm_pin: Option<bun_threading::GateGuest>,
         pub task: WorkPoolTask,
         pub r#ref: KeepAlive,
         pub tracker: AsyncTaskTracker,
@@ -2269,34 +2259,6 @@ mod _async_tasks {
     }
 
     bun_threading::intrusive_work_task!(AsyncReaddirRecursiveTask, task);
-
-    // SAFETY: plain drop in the dead-VM scope, after releasing the non-Drop
-    // resources (entry refs/bytes, queued entry boxes, the root fd).
-    unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for AsyncReaddirRecursiveTask {
-        unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-            let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
-            // SAFETY: caller owns `this` exclusively.
-            unsafe {
-                let task = &mut *this;
-                task.result_list.deinit();
-                let mut batch = task.result_list_queue.pop_batch().iterator();
-                loop {
-                    let entry = batch.next();
-                    if entry.is_null() {
-                        break;
-                    }
-                    let mut entry = bun_core::heap::take(entry);
-                    entry.value.deinit();
-                    drop(entry);
-                }
-                let root_fd = core::mem::replace(&mut task.root_fd, FD::INVALID);
-                if root_fd != FD::INVALID {
-                    let _ = root_fd.close();
-                }
-                drop(bun_core::heap::take(this));
-            }
-        }
-    }
 
     pub enum ResultListEntryValue {
         WithFileTypes(Vec<Dirent>),
@@ -2455,6 +2417,7 @@ mod _async_tasks {
                 has_result: AtomicBool::new(false),
                 global_object: bun_ptr::BackRef::new(global_object),
                 vm: vm.cross_thread_handle(),
+                vm_pin: None,
                 task: work_pool_task(Self::work_pool_callback),
                 r#ref: KeepAlive::default(),
                 tracker: AsyncTaskTracker::init(vm),
@@ -2467,6 +2430,7 @@ mod _async_tasks {
                 pending_err: None,
                 pending_err_mutex: bun_threading::Mutex::default(),
             });
+            task.vm_pin = Some(task.vm.pin());
             task.r#ref.ref_(bun_io::js_vm_ctx());
             task.tracker.did_schedule(global_object);
             let promise = task.promise.value();
@@ -2630,16 +2594,13 @@ mod _async_tasks {
                 }
             }
 
-            // On `false` (worker VM destroyed) the task is freed here.
+            // The pin (held since creation) admits the enqueue even while
+            // terminate is draining; drop it right after.
             let vm = self.vm.clone();
             let this_ptr = std::ptr::from_mut::<Self>(self);
-            if !vm.enqueue_task_concurrent(|| ConcurrentTask::create(Task::init(this_ptr))) {
-                // SAFETY: sole owner — the queue never took the task and all
-                // subtasks have finished (subtask_count hit zero above).
-                unsafe {
-                    <Self as bun_jsc::vm_handle::DisposeAfterVmDestroyed>::dispose_after_vm_destroyed(this_ptr);
-                }
-            }
+            let pin = self.vm_pin.take().expect("pin taken at create");
+            vm.enqueue_task_concurrent_pinned(&pin, || ConcurrentTask::create(Task::init(this_ptr)));
+            drop(pin);
         }
 
         fn clear_result_list(&mut self) {

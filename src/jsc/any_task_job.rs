@@ -47,6 +47,9 @@ pub trait AnyTaskJobCtx: Sized {
 pub struct AnyTaskJob<C> {
     /// Cross-thread handle to the owning VM; see [`crate::vm_handle::VMHandle`].
     vm: crate::vm_handle::VMHandle,
+    /// Holds the worker's shutdown gate open until the completion is
+    /// enqueued (dropped on the pool thread in `run_task`).
+    vm_pin: Option<bun_threading::GateGuest>,
     /// JSC_BORROW — forwarded to `ctx.run` off-thread (FFI reads only); the
     /// pool must not touch the VM through it.
     global: *mut crate::JSGlobalObject,
@@ -57,11 +60,6 @@ pub struct AnyTaskJob<C> {
 }
 
 bun_threading::intrusive_work_task!([C] AnyTaskJob<C>, task);
-
-// SAFETY: plain drop in the dead-VM scope — the job's own Drop and every
-// ctx's release paths (protect pins, handle slots, C++ deinits) are
-// scope-aware.
-unsafe impl<C: AnyTaskJobCtx> crate::vm_handle::DisposeAfterVmDestroyed for AnyTaskJob<C> {}
 
 impl<C> Drop for AnyTaskJob<C> {
     #[inline]
@@ -79,8 +77,10 @@ impl<C: AnyTaskJobCtx> AnyTaskJob<C> {
     /// until handed to [`Self::schedule`].
     pub fn create(global: &JSGlobalObject, ctx: C) -> JsResult<*mut Self> {
         let vm = global.bun_vm().cross_thread_handle();
+        let vm_pin = Some(vm.pin());
         let job = bun_core::heap::into_raw(Box::new(Self {
             vm,
+            vm_pin,
             global: core::ptr::from_ref(global).cast_mut(),
             task: WorkPoolTask {
                 node: Default::default(),
@@ -98,7 +98,7 @@ impl<C: AnyTaskJobCtx> AnyTaskJob<C> {
             (*job).any_task = AnyTask::from_typed_with_dispose(
                 job,
                 Self::run_from_js_erased,
-                <Self as crate::vm_handle::DisposeAfterVmDestroyed>::dispose_after_vm_destroyed,
+                Self::release_unrun,
             );
         }
         // `ctx.init` may throw (e.g. CryptoJob<Scrypt>); on error, reclaim the
@@ -149,22 +149,23 @@ impl<C: AnyTaskJobCtx> AnyTaskJob<C> {
         let job = unsafe { &mut *Self::from_task_ptr(task) };
         let vm = job.vm.clone();
         job.ctx.run(job.global);
-        // On success, `ConcurrentTask::create` heap-allocates a fresh task and
-        // the queue takes ownership; on `false` (worker VM destroyed) the job
-        // is freed here.
+        // The pin (held since `create`) admits the enqueue even while
+        // terminate is draining; drop it right after.
         let any_task = job.any_task.task();
-        if !vm.enqueue_task_concurrent(|| ConcurrentTask::create(any_task)) {
-            // SAFETY: sole owner — the queue never took the job.
-            unsafe {
-                <Self as crate::vm_handle::DisposeAfterVmDestroyed>::dispose_after_vm_destroyed(
-                    core::ptr::from_mut(job),
-                );
-            }
-        }
+        let pin = job.vm_pin.take().expect("pin taken at create");
+        vm.enqueue_task_concurrent_pinned(&pin, || ConcurrentTask::create(any_task));
+        drop(pin);
     }
 
     fn run_from_js_erased(this: *mut Self) -> bun_event_loop::AnyTask::JsResult<()> {
         Self::run_from_js(this).map_err(Into::into)
+    }
+
+    /// Reclaim a queued-but-unrun completion during the shutdown drain
+    /// (JS thread, VM alive): normal drop glue releases everything.
+    fn release_unrun(this: *mut Self) {
+        // SAFETY: queue-owned heap job popped by the drain; sole owner.
+        drop(unsafe { bun_core::heap::take(this) });
     }
 
     /// `AnyTask` callback — runs ON the JS thread. Reclaims the heap

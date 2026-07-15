@@ -88,16 +88,6 @@ impl MkdirpTarget for CopyFile<'_> {
 impl jsc::concurrent_promise_task::ConcurrentPromiseTaskContext for CopyFile<'_> {
     const TASK_TAG: bun_event_loop::TaskTag = bun_event_loop::task_tag::CopyFilePromiseTask;
 
-    fn dispose_extras_for_dead_vm(&mut self) {
-        // Close fds `then()` would have closed; everything else has drop glue.
-        for fd in [self.destination_fd, self.source_fd] {
-            if fd != Fd::INVALID {
-                let _ = fd.close();
-            }
-        }
-        self.destination_fd = Fd::INVALID;
-        self.source_fd = Fd::INVALID;
-    }
     fn run(&mut self) {
         self.run_async();
     }

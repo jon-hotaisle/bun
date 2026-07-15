@@ -3153,16 +3153,6 @@ extern "C" void NapiEnv__deref(napi_env env)
     env->deref();
 }
 
-extern "C" void NapiEnv__derefAfterVmDestroyed(napi_env env)
-{
-    // The owning VM's heap and HandleSet are already freed wholesale; the
-    // pending-exception Strong's slot died with them, so releasing it via
-    // ~Strong would write freed memory. Reconstruct it empty in place (the
-    // slot storage was owned by the dead HandleSet — nothing leaks), then
-    // release the ref normally.
-    env->neutralizePendingExceptionAfterVmDestroyed();
-    env->deref();
-}
 
 }
 

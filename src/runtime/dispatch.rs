@@ -1206,19 +1206,130 @@ pub(crate) fn __bun_release_task_at_shutdown(task: bun_event_loop::Task) -> bool
             for_each_fs_async_op!(__fs_destroy);
             true
         }
-        // A queued non-final chunk left `has_schedule_callback` set; the
-        // dispose unsticks it and aborts (mid-stream) or frees (final) — see
-        // `S3HttpDownloadStreamingTask::dispose_after_vm_destroyed`.
+        // Producer pins guarantee these transfers/jobs completed before the
+        // worker drain; the main-exit drain has no such barrier, so a
+        // mid-stream entry (HTTP thread still active) is left alone.
         task_tag::S3HttpDownloadStreamingTask => {
-            // SAFETY: the tag identifies the pointee; the queue owned this
-            // entry and the drain popped it.
+            let s3 = task.ptr.cast::<S3HttpDownloadStreamingTask>();
+            // SAFETY: queue-owned entry, live box.
             unsafe {
-                <S3HttpDownloadStreamingTask as bun_jsc::vm_handle::DisposeAfterVmDestroyed>::dispose_after_vm_destroyed(
-                    task.ptr.cast(),
-                );
+                if crate::webcore::s3::download_stream::State((*s3).state.load(
+                    core::sync::atomic::Ordering::Acquire,
+                ))
+                .has_more()
+                {
+                    return false;
+                }
+                // Barrier: a losing CAS callback may still be inside its
+                // mutex-guarded buffer append.
+                (*s3).mutex.lock();
+                (*s3).mutex.unlock();
+                ((*s3).callback_context_release)((*s3).callback_context.as_ptr().cast());
+                drop(bun_core::heap::take(s3));
             }
             true
         }
+        task_tag::S3HttpSimpleTask => {
+            let s3 = task.ptr.cast::<S3HttpSimpleTask>();
+            // SAFETY: queue-owned entry; `is_done` enqueue means the HTTP
+            // side is finished — sole owner.
+            unsafe {
+                ((*s3).callback_context_release)((*s3).callback_context);
+                drop(bun_core::heap::take(s3));
+            }
+            true
+        }
+        task_tag::NativeZlib => {
+            // SAFETY: releases the in-flight write()'s ref on the JS thread.
+            unsafe { <NativeZlib as node_zlib_binding::CompressionStreamImpl>::deref(task.ptr.cast()) };
+            true
+        }
+        task_tag::NativeBrotli => {
+            // SAFETY: as NativeZlib above.
+            unsafe { <NativeBrotli as node_zlib_binding::CompressionStreamImpl>::deref(task.ptr.cast()) };
+            true
+        }
+        task_tag::NativeZstd => {
+            // SAFETY: as NativeZlib above.
+            unsafe { <NativeZstd as node_zlib_binding::CompressionStreamImpl>::deref(task.ptr.cast()) };
+            true
+        }
+        task_tag::AsyncGlobWalkTask => {
+            // SAFETY: queue-owned completed task; destroy drops the box (and
+            // its ctx) on the JS thread with the VM alive.
+            unsafe { AsyncGlobWalkTask::destroy(task.ptr.cast()) };
+            true
+        }
+        task_tag::AsyncTransformTask => {
+            // SAFETY: as AsyncGlobWalkTask above.
+            unsafe { AsyncTransformTask::destroy(task.ptr.cast()) };
+            true
+        }
+        task_tag::AsyncImageTask => {
+            // SAFETY: as AsyncGlobWalkTask above.
+            unsafe { AsyncImageTask::destroy(task.ptr.cast()) };
+            true
+        }
+        task_tag::CopyFilePromiseTask => {
+            // SAFETY: as AsyncGlobWalkTask above.
+            unsafe { CopyFilePromiseTask::destroy(task.ptr.cast()) };
+            true
+        }
+        // WorkTask shells: destroy frees the shell; the heap ctx is dropped
+        // too (its completion-handler box is a known small leak here).
+        task_tag::ReadFileTask => {
+            // SAFETY: queue-owned completed task; sole owner.
+            unsafe {
+                let ctx = (*task.ptr.cast::<ReadFileTask>()).ctx;
+                ReadFileTask::destroy(task.ptr.cast());
+                bun_core::heap::destroy(ctx);
+            }
+            true
+        }
+        task_tag::WriteFileTask => {
+            // SAFETY: as ReadFileTask above.
+            unsafe {
+                let ctx = (*task.ptr.cast::<WriteFileTask>()).ctx;
+                WriteFileTask::destroy(task.ptr.cast());
+                bun_core::heap::destroy(ctx);
+            }
+            true
+        }
+        #[cfg(not(windows))]
+        task_tag::GetAddrInfoRequestTask => {
+            // SAFETY: queue-owned completed request; `release_unrun` frees
+            // the chained lookup boxes too (VM alive — their Drops are safe).
+            unsafe {
+                let ctx = (*task.ptr.cast::<get_addr_info_request::Task>()).ctx;
+                get_addr_info_request::Task::destroy(task.ptr.cast());
+                crate::dns_jsc::GetAddrInfoRequest::release_unrun(ctx);
+            }
+            true
+        }
+        task_tag::ArchiveExtractTask => {
+            // SAFETY: queue-owned completed task; destroy drops the box on
+            // the JS thread with the VM alive.
+            unsafe { ArchiveAsyncTask::release_unrun(task.ptr.cast::<ArchiveExtractTask>()) };
+            true
+        }
+        task_tag::ArchiveBlobTask => {
+            // SAFETY: as ArchiveExtractTask above.
+            unsafe { ArchiveAsyncTask::release_unrun(task.ptr.cast::<ArchiveBlobTask>()) };
+            true
+        }
+        task_tag::ArchiveWriteTask => {
+            // SAFETY: as ArchiveExtractTask above.
+            unsafe { ArchiveAsyncTask::release_unrun(task.ptr.cast::<ArchiveWriteTask>()) };
+            true
+        }
+        task_tag::ArchiveFilesTask => {
+            // SAFETY: as ArchiveExtractTask above.
+            unsafe { ArchiveAsyncTask::release_unrun(task.ptr.cast::<ArchiveFilesTask>()) };
+            true
+        }
+        // NapiAsyncWork is NOT reclaimed here: the work handle itself is
+        // addon-owned (`napi_delete_async_work`); freeing it would double
+        // free when the addon's destructor runs. Re-queued (leaks bounded).
         // Same reclaim `drop_concurrent_cpp_tasks` performs, but for tasks
         // that were already batch-moved into `self.tasks`. Must run before
         // JSC teardown: a Worker `dispatchExit` lambda's `~Ref<Worker>` walks
@@ -1237,68 +1348,6 @@ pub(crate) fn __bun_release_task_at_shutdown(task: bun_event_loop::Task) -> bool
         // static-rooted VM. Dispatching the type-erased `AnyTask` callback
         // is not generally safe at shutdown (e.g. `AsyncModule::on_done`,
         // `dns::Holder::run` call straight into JS).
-        _ => false,
-    }
-}
-
-/// `__bun_dispose_task_after_vm_destroyed` body — declared `extern "Rust"`
-/// in `bun_jsc::event_loop`. Called from `EventLoop::deinit` for tasks still
-/// queued when a worker VM is torn down: frees each per the
-/// [`bun_jsc::vm_handle::DisposeAfterVmDestroyed`] contract (the VM's JSC
-/// heap and HandleSet are gone — handle slots are forgotten, everything else
-/// is freed). Unclaimed tags return `false` and are dropped from the queue
-/// without freeing their box (owned elsewhere).
-#[unsafe(no_mangle)]
-pub(crate) fn __bun_dispose_task_after_vm_destroyed(task: bun_event_loop::Task) -> bool {
-    use bun_event_loop::task_tag;
-    use bun_jsc::vm_handle::DisposeAfterVmDestroyed as Dispose;
-    macro_rules! dispose_arm {
-        ($ty:ty) => {{
-            // SAFETY: the tag identifies the pointee; the queue owned this
-            // entry and the caller popped it — sole owner here.
-            unsafe { <$ty as Dispose>::dispose_after_vm_destroyed(task.ptr.cast()) };
-            true
-        }};
-    }
-    match task.tag {
-        // A queued progress update owns one JS-side ref; the final release
-        // routes through `dealloc_for_shutdown`'s worker branch.
-        task_tag::FetchTasklet => {
-            FetchTasklet::deref(task.ptr.cast::<FetchTasklet>());
-            true
-        }
-        task_tag::AsyncGlobWalkTask => dispose_arm!(AsyncGlobWalkTask<'_>),
-        task_tag::AsyncImageTask => dispose_arm!(AsyncImageTask<'_>),
-        task_tag::AsyncTransformTask => dispose_arm!(AsyncTransformTask<'_>),
-        task_tag::CopyFilePromiseTask => dispose_arm!(CopyFilePromiseTask<'_>),
-        task_tag::ReadFileTask => dispose_arm!(ReadFileTask),
-        task_tag::WriteFileTask => dispose_arm!(WriteFileTask),
-        #[cfg(not(windows))]
-        task_tag::GetAddrInfoRequestTask => dispose_arm!(get_addr_info_request::Task),
-        task_tag::ArchiveExtractTask => dispose_arm!(ArchiveExtractTask),
-        task_tag::ArchiveBlobTask => dispose_arm!(ArchiveBlobTask),
-        task_tag::ArchiveWriteTask => dispose_arm!(ArchiveWriteTask),
-        task_tag::ArchiveFilesTask => dispose_arm!(ArchiveFilesTask),
-        task_tag::NativeZlib => dispose_arm!(NativeZlib),
-        task_tag::NativeBrotli => dispose_arm!(NativeBrotli),
-        task_tag::NativeZstd => dispose_arm!(NativeZstd),
-        task_tag::S3HttpSimpleTask => dispose_arm!(S3HttpSimpleTask),
-        task_tag::S3HttpDownloadStreamingTask => dispose_arm!(S3HttpDownloadStreamingTask),
-        task_tag::NapiAsyncWork => dispose_arm!(napi_async_work),
-        // POSIX only: on Windows these tags are `UVFSRequest`s whose
-        // completions run on the worker's own uv loop (same thread).
-        #[cfg(not(windows))]
-        for_each_fs_async_op!(__fs_pat) => {
-            macro_rules! __fs_dispose {
-                ($($tag:ident $ty:ident;)*) => { match task.tag {
-                    $(task_tag::$tag => { dispose_arm!(fs_async::$ty); })*
-                    // SAFETY: outer arm guard proves one of the table tags matched.
-                    _ => unsafe { core::hint::unreachable_unchecked() },
-                }};
-            }
-            for_each_fs_async_op!(__fs_dispose);
-            true
-        }
         _ => false,
     }
 }

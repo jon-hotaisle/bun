@@ -121,12 +121,15 @@ pub struct S3HttpSimpleTask {
     /// Cross-thread handle to the owning VM; see `VMHandle`. `None` only in
     /// the inert `Default` placeholder (overwritten before the task escapes).
     pub vm: Option<VMHandle>,
+    /// Holds the worker's shutdown gate open until the completion is
+    /// enqueued (set at creation, dropped on the HTTP thread).
+    pub vm_pin: Option<bun_threading::GateGuest>,
     pub sign_result: SignResult,
     pub headers: Headers,
     pub callback_context: *mut c_void,
     /// Frees `callback_context` when the owning VM died before `on_response`
     /// could run (see `DisposeAfterVmDestroyed` impl below).
-    pub callback_context_dispose: unsafe fn(*mut c_void),
+    pub callback_context_release: unsafe fn(*mut c_void),
     pub callback: Callback,
     pub response_buffer: MutableString,
     // `'static` here because `result.body` (when set) points at our own
@@ -160,10 +163,11 @@ impl Default for S3HttpSimpleTask {
         Self {
             http: core::mem::MaybeUninit::uninit(),
             vm: None,
+            vm_pin: None,
             sign_result: SignResult::default(),
             headers: Headers::default(),
             callback_context: core::ptr::null_mut(),
-            callback_context_dispose: noop_context_dispose,
+            callback_context_release: noop_context_release,
             callback: Callback::Upload(unset_callback),
             response_buffer: MutableString::default(),
             result: HTTPClientResult::default(),
@@ -181,9 +185,9 @@ pub use bun_jsc::JsTerminatedResult;
 
 /// Dispose for callback contexts that own nothing the task must free
 /// (e.g. independently-refcounted `MultiPartUpload`).
-/// Dead-VM dispose for callback ctxs owned elsewhere (independently
-/// refcounted JS-thread objects): nothing to free from the HTTP thread.
-pub(crate) unsafe fn noop_context_dispose(_: *mut c_void) {}
+/// Terminate-drain release for callback ctxs owned elsewhere (independently
+/// refcounted JS-thread objects): nothing to free from the drain.
+pub(crate) unsafe fn noop_context_release(_: *mut c_void) {}
 
 pub enum Callback {
     Stat(fn(S3StatResult<'_>, *mut c_void) -> JsTerminatedResult<()>),
@@ -345,7 +349,20 @@ impl S3HttpSimpleTask {
     // ConcurrentTask dispatch entrypoint (see `runtime::dispatch`): `this` is the raw task
     // pointer the queue hands back, non-null by the `ConcurrentTask::from` contract.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    /// Terminate/exit abort (JS thread, task alive — registered until
+    /// `on_response`): wake the HTTP side so the final callback fires and
+    /// the producer pin drops.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub(crate) unsafe fn abort_for_terminate_erased(this: *mut core::ffi::c_void) {
+        // SAFETY: registered after `http` was initialised; still live.
+        let id = unsafe { (*this.cast::<Self>()).http.assume_init_ref().async_http_id };
+        bun_http::http_thread().schedule_shutdown_by_id(id);
+    }
+
+    // `this` is the queue's opaque hand-off; ownership reclaimed exactly once.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn on_response(this: *mut Self) -> JsTerminatedResult<()> {
+        VirtualMachine::get().unregister_terminate_abort(this.cast());
         // SAFETY: `this` was produced by `S3HttpSimpleTask::new` (heap::alloc) and ownership is
         // reclaimed here exactly once via the ConcurrentTask `.manual_deinit` contract;
         // `this` is dropped at scope exit.
@@ -488,24 +505,11 @@ impl S3HttpSimpleTask {
             // to avoid a stacked-borrows / aliasing diagnostic on `*this`.
             let this_ptr = std::ptr::from_mut::<Self>(this);
             let vm = this.vm.clone().expect("vm set at task creation");
-            // On `false` (worker VM destroyed) `enqueue_intrusive` frees the
-            // task via `DisposeAfterVmDestroyed`; the transfer is already
-            // complete (`is_done`), so no socket is held.
-            let _ = vm.enqueue_intrusive(&mut this.concurrent_task, this_ptr);
-        }
-    }
-}
-
-// SAFETY: frees `this` exactly once per the trait contract. Runs on the HTTP
-// thread when `enqueue_intrusive` finds the owning worker VM destroyed.
-unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for S3HttpSimpleTask {
-    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
-        // SAFETY: caller owns `this` exclusively; `Drop` handles the http
-        // cleanup (its loop unref no-ops inside the scope).
-        unsafe {
-            ((*this).callback_context_dispose)((*this).callback_context);
-            drop(bun_core::heap::take(this));
+            // The pin (held since creation) admits the enqueue even while
+            // terminate is draining; drop it right after.
+            let pin = this.vm_pin.take().expect("pin taken at creation");
+            vm.enqueue_intrusive_pinned(&pin, &mut this.concurrent_task, this_ptr);
+            drop(pin);
         }
     }
 }
@@ -586,7 +590,7 @@ pub(crate) fn execute_simple_s3_request(
     options: S3SimpleRequestOptions<'_>,
     callback: Callback,
     callback_context: *mut c_void,
-    callback_context_dispose: unsafe fn(*mut c_void),
+    callback_context_release: unsafe fn(*mut c_void),
 ) -> JsTerminatedResult<()> {
     let result = match this.sign_request::<false>(
         &SignOptions {
@@ -643,11 +647,12 @@ pub(crate) fn execute_simple_s3_request(
         http: core::mem::MaybeUninit::uninit(),
         sign_result: result,
         callback_context,
-        callback_context_dispose,
+        callback_context_release,
         callback,
         range: options.range,
         headers,
         vm: Some(VirtualMachine::get().cross_thread_handle()),
+        vm_pin: Some(VirtualMachine::get().cross_thread_handle().pin()),
         response_buffer: MutableString::default(),
         result: HTTPClientResult::default(),
         concurrent_task: ConcurrentTask::default(),
@@ -713,6 +718,10 @@ pub(crate) fn execute_simple_s3_request(
             ..Default::default()
         },
     ));
+    // Terminate/exit can abort this transfer while the VM is alive.
+    vm.terminate_abort_registry
+        .borrow_mut()
+        .push((task_ptr.cast(), S3HttpSimpleTask::abort_for_terminate_erased));
     // queue http request
     bun_http::http_thread::init(&Default::default());
     let mut batch = thread_pool::Batch::default();

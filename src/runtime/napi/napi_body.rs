@@ -73,7 +73,6 @@ unsafe extern "C" {
     fn NapiEnv__hasPendingException(env: *mut NapiEnv) -> bool;
     fn napi_internal_get_version(env: *mut NapiEnv) -> u32;
     fn NapiEnv__deref(env: *mut NapiEnv);
-    fn NapiEnv__derefAfterVmDestroyed(env: *mut NapiEnv);
     fn NapiEnv__ref(env: *mut NapiEnv);
     fn napi_set_last_error(env: napi_env, status: NapiStatus) -> napi_status;
 }
@@ -147,13 +146,6 @@ unsafe impl bun_ptr::ExternalSharedDescriptor for NapiEnv {
         unsafe { NapiEnv__ref(this) }
     }
     unsafe fn ext_deref(this: *mut Self) {
-        // Inside a dead-VM disposal scope the pending-exception slot died
-        // with the VM; the C++ helper neutralizes it before deref'ing.
-        if bun_core::dead_vm_scope::in_dead_vm_disposal() {
-            // SAFETY: caller contract — `this` is a valid C++-owned napi_env.
-            unsafe { NapiEnv__derefAfterVmDestroyed(this) };
-            return;
-        }
         // SAFETY: caller contract — `this` is a valid C++-owned napi_env.
         unsafe { NapiEnv__deref(this) }
     }
@@ -1735,6 +1727,9 @@ pub struct napi_async_work {
     pub concurrent_task: ConcurrentTask,
     /// Cross-thread handle to the owning VM; see [`VMHandle`].
     pub vm: VMHandle,
+    /// Holds the worker's shutdown gate open from `schedule` until the
+    /// completion is enqueued (dropped on the pool thread).
+    pub vm_pin: Option<bun_threading::GateGuest>,
     pub global: GlobalRef, // JSC_BORROW (lives for vm lifetime)
     pub env: NapiEnvRef,
     pub execute: napi_async_execute_callback,
@@ -1746,11 +1741,6 @@ pub struct napi_async_work {
 }
 
 bun_threading::intrusive_work_task!(napi_async_work, task);
-
-// SAFETY: plain drop in the dead-VM scope — the env ref's release routes
-// through the scope-aware `ext_deref`; `data` stays addon-owned, same
-// contract as Node when a worker dies mid-work.
-unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for napi_async_work {}
 
 impl napi_async_work {
     pub fn new(
@@ -1772,6 +1762,7 @@ impl napi_async_work {
             env: unsafe { NapiEnvRef::clone_from_raw(env.as_mut_ptr()) },
             execute,
             vm: global.bun_vm().cross_thread_handle(),
+            vm_pin: None,
             complete,
             data,
             status: AtomicU32::new(AsyncWorkStatus::Pending as u32),
@@ -1795,6 +1786,8 @@ impl napi_async_work {
         }
         self.scheduled = true;
         self.poll_ref.ref_(bun_io::js_vm_ctx());
+        // Terminate blocks until this work's completion is enqueued.
+        self.vm_pin = Some(self.vm.pin());
         WorkPool::schedule(&raw mut self.task);
     }
 
@@ -1813,10 +1806,10 @@ impl napi_async_work {
             Ordering::SeqCst,
         ) {
             if state == AsyncWorkStatus::Cancelled as u32 {
-                // On `false` (worker VM destroyed) the work is leaked per the
-                // `VMHandle::enqueue_task_concurrent` policy.
                 let vm = self.vm.clone();
-                let _ = vm.enqueue_intrusive(&mut self.concurrent_task, self_ptr);
+                let pin = self.vm_pin.take().expect("pin taken at schedule");
+                vm.enqueue_intrusive_pinned(&pin, &mut self.concurrent_task, self_ptr);
+                drop(pin);
                 return;
             }
         }
@@ -1824,10 +1817,12 @@ impl napi_async_work {
         self.status
             .store(AsyncWorkStatus::Completed as u32, Ordering::SeqCst);
 
-        // On `false` (worker VM destroyed) the work is leaked per the
-        // `VMHandle::enqueue_task_concurrent` policy.
+        // The pin (held since `schedule`) admits the enqueue even while
+        // terminate is draining; drop it right after.
         let vm = self.vm.clone();
-        let _ = vm.enqueue_intrusive(&mut self.concurrent_task, self_ptr);
+        let pin = self.vm_pin.take().expect("pin taken at schedule");
+        vm.enqueue_intrusive_pinned(&pin, &mut self.concurrent_task, self_ptr);
+        drop(pin);
     }
 
     pub fn cancel(&mut self) -> bool {

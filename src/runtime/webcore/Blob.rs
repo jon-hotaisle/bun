@@ -611,8 +611,8 @@ impl BlobExt for Blob {
                 }
 
                 /// # Safety
-                /// Dead-VM path only: caller owns `ptr` exclusively.
-                unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
+                /// Terminate-drain reclaim (JS thread, VM alive): caller owns `ptr`.
+                unsafe fn release_unrun(ptr: *mut c_void) {
                     // No JSC handles: `blob`'s StoreRef deref is thread-safe,
                     // `ctx` is caller-owned, `poll` (KeepAlive) has no Drop.
                     // SAFETY: same heap ctx `run`/the callback would have consumed; sole owner.
@@ -659,7 +659,7 @@ impl BlobExt for Blob {
                     len,
                     Task::<H>::cb,
                     t_ptr,
-                    Task::<H>::dispose_for_dead_vm,
+                    Task::<H>::release_unrun,
                     proxy.as_deref(),
                     payer,
                 )?;
@@ -669,7 +669,7 @@ impl BlobExt for Blob {
                     path,
                     Task::<H>::cb,
                     t_ptr,
-                    Task::<H>::dispose_for_dead_vm,
+                    Task::<H>::release_unrun,
                     proxy.as_deref(),
                     payer,
                 )?;
@@ -715,7 +715,6 @@ impl BlobExt for Blob {
                 self.store().expect("infallible: store present").clone(),
                 ctx.cast::<c_void>(),
                 NewInternalReadFileHandler::<C, F>::run,
-                NewInternalReadFileHandler::<C, F>::dispose_nothing,
                 self.offset.get(),
                 self.size.get(),
             )
@@ -3913,10 +3912,6 @@ impl<C, F> NewInternalReadFileHandler<C, F>
 where
     F: InternalReadFileFn<C>,
 {
-    /// Dead-VM dispose: the ctx is a JS-heap-rooted reader state that died
-    /// with the VM — nothing to free from here.
-    pub unsafe fn dispose_nothing(_handler: *mut c_void) {}
-
     /// Type-erased thunk: `handler` is the `*mut C` ctx that was passed into
     /// `ReadFile`/`ReadFileUV` cast to `*mut c_void`.
     pub fn run(handler: *mut c_void, bytes: read_file::ReadFileResultType) {
@@ -4694,7 +4689,7 @@ fn write_file_with_empty_source_to_destination(
                 /// # Safety
                 /// Dead-VM path only: caller owns `ptr` exclusively and the
                 /// owning VM (and `promise`'s slot storage) is gone.
-                unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
+                unsafe fn release_unrun(ptr: *mut c_void) {
                     // SAFETY: same heap ctx the callback would have consumed;
                     // sole owner (the scope forgets the promise slot).
                     drop(unsafe { bun_core::heap::take(ptr.cast::<Wrapper>()) });
@@ -4725,7 +4720,7 @@ fn write_file_with_empty_source_to_destination(
                     global: bun_ptr::BackRef::new(ctx),
                 }))
                 .cast::<c_void>(),
-                Wrapper::dispose_for_dead_vm,
+                Wrapper::release_unrun,
             )?;
             return Ok(promise_value);
         }
@@ -4805,7 +4800,6 @@ pub fn write_file_with_source_destination(
                 source_blob.borrowed_view(),
                 write_file_promise,
                 WriteFilePromise::run,
-                WriteFilePromise::dispose_for_dead_vm,
                 options.mkdirp_if_not_exists.unwrap_or(true),
             )
             .expect("unreachable");
@@ -4989,7 +4983,7 @@ pub fn write_file_with_source_destination(
                         /// # Safety
                         /// Dead-VM path only: caller owns `ptr` exclusively and
                         /// the owning VM (and `promise`'s slot storage) is gone.
-                        unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
+                        unsafe fn release_unrun(ptr: *mut c_void) {
                             // SAFETY: same heap ctx the callback would have
                             // consumed; sole owner (scope forgets the slot).
                             drop(unsafe { bun_core::heap::take(ptr.cast::<Wrapper>()) });
@@ -5017,7 +5011,7 @@ pub fn write_file_with_source_destination(
                             global: bun_ptr::BackRef::new(ctx),
                         }))
                         .cast::<c_void>(),
-                        Wrapper::dispose_for_dead_vm,
+                        Wrapper::release_unrun,
                     )?;
                     return Ok(promise_value);
                 }
@@ -5934,9 +5928,8 @@ impl S3BlobDownloadTask {
     }
 
     /// # Safety
-    /// Dead-VM path only: caller owns `ptr` exclusively and the owning VM
-    /// (and `promise`'s slot storage) is gone.
-    unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
+    /// Terminate-drain reclaim (JS thread, VM alive): caller owns `ptr`.
+    unsafe fn release_unrun(ptr: *mut c_void) {
         // SAFETY: same heap ctx the callback would have consumed; sole owner
         // (the caller's dead-VM scope forgets the promise slot and loop ref).
         drop(unsafe { bun_core::heap::take(ptr.cast::<S3BlobDownloadTask>()) });
@@ -5998,7 +5991,7 @@ impl S3BlobDownloadTask {
                 len,
                 s3_cb,
                 this.cast::<c_void>(),
-                Self::dispose_for_dead_vm,
+                Self::release_unrun,
                 proxy,
                 s3_store.request_payer,
             )?;
@@ -6008,7 +6001,7 @@ impl S3BlobDownloadTask {
                 path,
                 s3_cb,
                 this.cast::<c_void>(),
-                Self::dispose_for_dead_vm,
+                Self::release_unrun,
                 proxy,
                 s3_store.request_payer,
             )?;
@@ -6022,7 +6015,7 @@ impl S3BlobDownloadTask {
                 Some(len),
                 s3_cb,
                 this.cast::<c_void>(),
-                Self::dispose_for_dead_vm,
+                Self::release_unrun,
                 proxy,
                 s3_store.request_payer,
             )?;

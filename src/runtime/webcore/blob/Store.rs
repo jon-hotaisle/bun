@@ -374,7 +374,7 @@ impl S3Ext for S3 {
             /// # Safety
             /// Dead-VM path only: caller owns `ptr` exclusively and the owning
             /// VM (and `promise`'s slot storage) is gone.
-            unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
+            unsafe fn release_unrun(ptr: *mut c_void) {
                 // SAFETY: same heap ctx the callback would have consumed;
                 // sole owner (the scope forgets the promise slot).
                 drop(unsafe { bun_core::heap::take(ptr.cast::<Wrapper>()) });
@@ -411,7 +411,7 @@ impl S3Ext for S3 {
                 global: bun_ptr::BackRef::new(global_this),
             }))
             .cast::<c_void>(),
-            Wrapper::dispose_for_dead_vm,
+            Wrapper::release_unrun,
             proxy,
             aws_options.request_payer,
         )?;
@@ -479,7 +479,7 @@ impl S3Ext for S3 {
             /// # Safety
             /// Dead-VM path only: caller owns `ptr` exclusively and the owning
             /// VM (and `promise`'s slot storage) is gone.
-            unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
+            unsafe fn release_unrun(ptr: *mut c_void) {
                 // SAFETY: same heap ctx the callback would have consumed;
                 // sole owner (the scope forgets the promise slot).
                 drop(unsafe { bun_core::heap::take(ptr.cast::<Wrapper>()) });
@@ -527,7 +527,7 @@ impl S3Ext for S3 {
             unsafe { &(*wrapper).resolved_list_options },
             Wrapper::resolve,
             wrapper.cast::<c_void>(),
-            Wrapper::dispose_for_dead_vm,
+            Wrapper::release_unrun,
             proxy,
         )?;
 

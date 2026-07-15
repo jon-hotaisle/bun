@@ -53,12 +53,8 @@ impl Strong {
 }
 
 impl Drop for Strong {
-    /// Release the strong reference. Inside a dead-VM disposal scope the
-    /// slot storage died with the VM's HandleSet and is forgotten instead.
+    /// Release the strong reference.
     fn drop(&mut self) {
-        if bun_core::dead_vm_scope::in_dead_vm_disposal() {
-            return;
-        }
         // SAFETY: `self.handle` came from `Impl::init` and is consumed exactly once here.
         unsafe { Impl::destroy(self.handle) };
     }
@@ -154,9 +150,6 @@ impl Optional {
     /// leaving `self` empty so `Drop` is a no-op.
     pub fn deinit(&mut self) {
         let Some(r) = self.handle.take() else { return };
-        if bun_core::dead_vm_scope::in_dead_vm_disposal() {
-            return;
-        }
         // SAFETY: `r` came from `Impl::init` and is consumed exactly once here.
         unsafe { Impl::destroy(r) };
     }
@@ -174,13 +167,9 @@ impl Optional {
 }
 
 impl Drop for Optional {
-    /// Frees memory for the underlying Strong reference (forgotten inside a
-    /// dead-VM disposal scope — the slot died with the VM's HandleSet).
+    /// Frees memory for the underlying Strong reference.
     fn drop(&mut self) {
         let Some(r) = self.handle.take() else { return };
-        if bun_core::dead_vm_scope::in_dead_vm_disposal() {
-            return;
-        }
         // SAFETY: `r` came from `Impl::init` and is consumed exactly once here.
         unsafe { Impl::destroy(r) };
     }

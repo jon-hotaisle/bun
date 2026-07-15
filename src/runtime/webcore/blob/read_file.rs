@@ -1,4 +1,3 @@
-use bun_sys::FdExt as _;
 use core::ffi::c_void;
 use core::marker::PhantomData;
 #[cfg(windows)]
@@ -86,22 +85,9 @@ pub trait ReadFileCompletion {
     /// `ctx` must be a heap-allocated `Self` whose ownership is transferred to
     /// this call (it is reclaimed via `bun_core::heap::take`).
     unsafe fn run(ctx: *mut Self, bytes: ReadFileResultType) -> jsc::JsTerminatedResult<()>;
-
-    /// Free `ctx` after the owning VM was destroyed (`run` will never fire):
-    /// forget JSC handle fields, free owned heap. No-op for non-owning ctxs.
-    ///
-    /// # Safety
-    /// Same ownership transfer as `run`; the owning VM is gone.
-    unsafe fn dispose_for_dead_vm(ctx: *mut Self);
 }
 
 impl<'a, F: ReadFileToJs> ReadFileCompletion for NewReadFileHandler<'a, F> {
-    unsafe fn dispose_for_dead_vm(ctx: *mut Self) {
-        // SAFETY: same heap allocation `run` would have consumed; the
-        // caller's dead-VM scope forgets the promise slot, the Blob drops.
-        drop(unsafe { bun_core::heap::take(ctx) });
-    }
-
     unsafe fn run(
         handler: *mut Self,
         maybe_bytes: ReadFileResultType,
@@ -180,25 +166,6 @@ pub type ReadFileTask = bun_jsc::work_task::WorkTask<ReadFile>;
 impl bun_jsc::work_task::WorkTaskContext for ReadFile {
     const TASK_TAG: bun_event_loop::TaskTag = bun_event_loop::task_tag::ReadFileTask;
 
-    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        // SAFETY: sole owner; `run` completed on the pool, so no io is in
-        // flight. The erased completion ctx is freed by the monomorphized
-        // dispose captured at creation; the box drops in the caller's scope.
-        unsafe {
-            let file = &mut *this;
-            (file.on_complete_dispose)(file.on_complete_ctx);
-            // Mirror `do_close`: only path-opened fds are ours to close —
-            // fd-backed blobs (`Bun.file(fd)`, stdio) borrow the caller's.
-            if file.is_allowed_to_close()
-                && file.opened_fd != Fd::INVALID
-                && file.opened_fd.stdio_tag().is_none()
-            {
-                let _ = file.opened_fd.close();
-                file.opened_fd = Fd::INVALID;
-            }
-            drop(bun_core::heap::take(this));
-        }
-    }
     fn run(this: *mut Self, task: *mut bun_jsc::work_task::WorkTask<Self>) {
         // SAFETY: WorkTask::run_from_thread_pool guarantees `this` is live.
         unsafe { (*this).run(task) }
@@ -230,8 +197,6 @@ pub struct ReadFile {
     pub errno: Option<Error>,
     pub on_complete_ctx: *mut c_void,
     pub on_complete_callback: ReadFileOnReadFileCallback,
-    /// Frees `on_complete_ctx` when the owning VM died before completion.
-    pub on_complete_dispose: unsafe fn(*mut c_void),
     pub io_task: Option<*mut ReadFileTask>,
     pub io_poll: io::Poll,
     pub io_request: io::Request,
@@ -375,7 +340,6 @@ impl ReadFile {
         store: StoreRef,
         on_read_file_context: *mut c_void,
         on_complete_callback: ReadFileOnReadFileCallback,
-        on_complete_dispose: unsafe fn(*mut c_void),
         off: SizeType,
         max_len: SizeType,
     ) -> Result<Box<ReadFile>, Error> {
@@ -401,7 +365,6 @@ impl ReadFile {
             errno: None,
             on_complete_ctx: on_read_file_context,
             on_complete_callback,
-            on_complete_dispose,
             io_task: None,
             io_poll: io::Poll::default(),
             io_request: io::Request {
@@ -434,16 +397,10 @@ impl ReadFile {
             // `on_complete_ctx`; ownership transfers per `ReadFileCompletion::run`.
             let _ = unsafe { C::run(ctx.cast::<C>(), bytes) };
         }
-        // Monomorphized dead-VM dispose for the erased ctx.
-        unsafe fn handler_dispose<C: ReadFileCompletion>(ctx: *mut c_void) {
-            // SAFETY: `ctx` is the `*mut C` stored in `on_complete_ctx`.
-            unsafe { C::dispose_for_dead_vm(ctx.cast::<C>()) };
-        }
         ReadFile::create_with_ctx(
             store,
             context.cast::<c_void>(),
             handler_run::<C>,
-            handler_dispose::<C>,
             off,
             max_len,
         )

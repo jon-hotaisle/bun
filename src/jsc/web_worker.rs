@@ -1290,7 +1290,7 @@ impl WebWorker {
                 // must precede the gate close so the HTTP thread's last deref
                 // only ever frees process-heap state.
                 // SAFETY: sole owner (unpublished above); JS thread, pre-teardown.
-                unsafe { (hooks.detach_fetch_tasklets)(vm_ptr) };
+                unsafe { (hooks.abort_pending_transfers)(vm_ptr) };
             }
             // Close the cross-thread VMHandle gate: producers that lose the
             // race dispose their completion objects themselves from here on.

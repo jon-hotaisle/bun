@@ -21,12 +21,17 @@ pub struct S3HttpDownloadStreamingTask {
     /// Cross-thread handle to the owning VM; see `VMHandle`. `None` only in
     /// the inert `Default` placeholder (overwritten before the task escapes).
     pub vm: Option<VMHandle>,
+    /// Holds the worker's shutdown gate open for the whole transfer (set at
+    /// creation, dropped on the HTTP thread at the final enqueue) — terminate
+    /// waits for the download to finish. FIXME: register with a per-VM abort
+    /// list (like fetch) so terminate aborts instead of waiting.
+    pub vm_pin: Option<bun_threading::GateGuest>,
     pub sign_result: SignResult,
     pub headers: Headers,
     pub callback_context: NonNull<()>,
     /// Frees `callback_context` when the owning VM died before the final
     /// `on_response` could run (see `DisposeAfterVmDestroyed` impl below).
-    pub callback_context_dispose: unsafe fn(*mut c_void),
+    pub callback_context_release: unsafe fn(*mut c_void),
     pub callback: fn(chunk: &MutableString, has_more: bool, err: Option<S3Error>, ctx: *mut c_void),
     pub has_schedule_callback: AtomicBool,
     pub signal_store: bun_http::signals::Store,
@@ -65,10 +70,11 @@ impl Default for S3HttpDownloadStreamingTask {
             // never read — fully overwritten by `AsyncHTTP::init` before first use.
             http: core::mem::MaybeUninit::uninit(),
             vm: None,
+            vm_pin: None,
             sign_result: SignResult::default(),
             headers: Headers::default(),
             callback_context: NonNull::dangling(),
-            callback_context_dispose: crate::webcore::s3::simple_request::noop_context_dispose,
+            callback_context_release: crate::webcore::s3::simple_request::noop_context_release,
             callback: |_, _, _, _| {},
             range: None,
             proxy_url: Box::default(),
@@ -191,6 +197,21 @@ impl S3HttpDownloadStreamingTask {
     /// `this` must be a live heap pointer produced by `Self::new`; the event loop guarantees
     /// exclusive main-thread access for the duration of this call. When the loaded state's
     /// `has_more` is false this call reclaims and drops the allocation exactly once.
+    /// Terminate/exit abort (JS thread, task alive — registered until the
+    /// final `on_response`): flag the abort and wake the HTTP side so the
+    /// final callback fires and the producer pin drops.
+    pub(crate) unsafe fn abort_for_terminate_erased(this: *mut core::ffi::c_void) {
+        let task = this.cast::<Self>();
+        // SAFETY: registered entries stay live until unregistered.
+        unsafe {
+            (*task)
+                .signal_store
+                .aborted
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+            bun_http::http_thread().schedule_shutdown_by_id((*task).async_http_id);
+        }
+    }
+
     pub(crate) fn on_response(this: *mut Self) {
         // SAFETY: `this` is a live heap allocation created via `Self::new`; the event loop
         // guarantees exclusive access on the main thread for the duration of this callback.
@@ -200,6 +221,9 @@ impl S3HttpDownloadStreamingTask {
         // the state is atomic let's load it once
         let state = self_.get_state();
         let has_more = state.has_more();
+        if !has_more {
+            bun_jsc::virtual_machine::VirtualMachine::get().unregister_terminate_abort(this.cast());
+        }
         // Use a scopeguard so any future early-exit / unwind through
         // `report_progress` still unlocks + deinits.
         let this_ptr = this;
@@ -343,50 +367,22 @@ impl S3HttpDownloadStreamingTask {
         let self_ = unsafe { &mut *this };
         // SAFETY: `async_http` is the live HTTP-thread copy; non-null for the callback's duration.
         let async_http = unsafe { &mut *async_http };
+        let is_final = !result.has_more;
+        // Take the pin out FIRST on the final chunk: the enqueue publishes
+        // the task and the JS thread may free it before we return.
+        let final_pin = if is_final { self_.vm_pin.take() } else { None };
         if self_.process_http_callback(async_http, result) {
             // we are always unlocked here and its safe to enqueue
             let vm = self_.vm.clone().expect("vm set at task creation");
-            // On `false` (worker VM destroyed) `enqueue_intrusive` runs
-            // `DisposeAfterVmDestroyed`: mid-stream it aborts the transfer and
-            // keeps the task alive; on the final callback it frees everything.
-            let _ = vm.enqueue_intrusive(&mut self_.concurrent_task, this);
+            // The pin (held since creation) admits enqueues even while
+            // terminate is draining; released after the final enqueue.
+            let pin = final_pin
+                .as_ref()
+                .or(self_.vm_pin.as_ref())
+                .expect("pin held until the final chunk");
+            vm.enqueue_intrusive_pinned(pin, &mut self_.concurrent_task, this);
         }
-    }
-}
-
-// SAFETY: frees `this` exactly once per the trait contract (mid-stream calls
-// defer to the final callback, which re-enters via `enqueue_intrusive`).
-// Runs on the HTTP thread when the owning worker VM is destroyed.
-unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for S3HttpDownloadStreamingTask {
-    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        // SAFETY: caller owns `this` exclusively (the queue never took it).
-        let state = State(unsafe { (*this).state.load(Ordering::Acquire) });
-        if state.has_more() {
-            // Transfer still in flight: the HTTP client aliases our buffers,
-            // so abort and let the final callback re-enter here to free.
-            // SAFETY: `this` stays live; only atomics are touched.
-            unsafe {
-                (*this)
-                    .has_schedule_callback
-                    .store(false, Ordering::Release);
-                bun_http::http_thread().schedule_shutdown_by_id((*this).async_http_id);
-            }
-            return;
-        }
-        // Barrier: a losing CAS callback may still be inside its
-        // mutex-guarded buffer append; taking the lock once proves it left.
-        // SAFETY: `this` is live until the take below.
-        unsafe {
-            (*this).mutex.lock();
-            (*this).mutex.unlock();
-        }
-        let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
-        // SAFETY: final callback — sole owner; `Drop` handles the http
-        // cleanup (its loop unref no-ops inside the scope).
-        unsafe {
-            ((*this).callback_context_dispose)((*this).callback_context.as_ptr().cast());
-            drop(bun_core::heap::take(this));
-        }
+        drop(final_pin);
     }
 }
 

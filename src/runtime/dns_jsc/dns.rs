@@ -1356,19 +1356,16 @@ pub mod get_addr_info_request {
     }
 }
 
-// `WorkTaskContext` fixes `run`/`then` to take `*mut Self`; the trait method
-// cannot be marked `unsafe fn` and the parameter type cannot change, so the
-// lint is unsatisfiable here. The pointers come from the work-pool hand-off
-// and are guaranteed live (see SAFETY notes below).
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-impl jsc::work_task::WorkTaskContext for GetAddrInfoRequest {
-    const TASK_TAG: bun_event_loop::ConcurrentTask::TaskTag =
-        bun_event_loop::ConcurrentTask::task_tag::GetAddrInfoRequestTask;
-
-    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        // SAFETY: sole owner; the chained `DNSLookup` boxes are freed too
-        // (their Drop no-ops inside the caller's dead-VM scope; the request
-        // embeds only the head node).
+impl GetAddrInfoRequest {
+    /// Reclaim a queued-but-unrun completion during the terminate drain
+    /// (JS thread, VM alive): frees the request and every chained lookup box
+    /// (their Drops release poll refs and resolver refs normally).
+    ///
+    /// # Safety
+    /// `this` is the queue-owned heap request popped by the drain.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub unsafe fn release_unrun(this: *mut Self) {
+        // SAFETY: caller contract.
         unsafe {
             let mut next = (*this).head.next;
             drop(bun_core::heap::take(this));
@@ -1378,6 +1375,16 @@ impl jsc::work_task::WorkTaskContext for GetAddrInfoRequest {
             }
         }
     }
+}
+
+// `WorkTaskContext` fixes `run`/`then` to take `*mut Self`; the trait method
+// cannot be marked `unsafe fn` and the parameter type cannot change, so the
+// lint is unsatisfiable here. The pointers come from the work-pool hand-off
+// and are guaranteed live (see SAFETY notes below).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+impl jsc::work_task::WorkTaskContext for GetAddrInfoRequest {
+    const TASK_TAG: bun_event_loop::ConcurrentTask::TaskTag =
+        bun_event_loop::ConcurrentTask::task_tag::GetAddrInfoRequestTask;
 
     #[inline]
     fn run(this: *mut Self, task: *mut get_addr_info_request::Task) {
@@ -2177,11 +2184,6 @@ impl DNSLookup {
 impl Drop for DNSLookup {
     fn drop(&mut self) {
         bun_output::scoped_log!(DNSLookup, "deinit");
-        // The loop and resolver died with the VM inside a dead-VM disposal
-        // scope (the resolver lives in the VM's GlobalData).
-        if bun_core::dead_vm_scope::in_dead_vm_disposal() {
-            return;
-        }
         let _ = self.global_this();
         // DNSLookup is always created on the JS event loop (it holds a JSGlobalObject),
         // so the Js-arm vtable is the correct EventLoopCtx for KeepAlive::unref.

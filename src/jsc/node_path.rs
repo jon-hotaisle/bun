@@ -71,11 +71,7 @@ impl<T: Unprotect> core::ops::DerefMut for ThreadSafe<T> {
 impl<T: Unprotect> Drop for ThreadSafe<T> {
     #[inline]
     fn drop(&mut self) {
-        // The protect pin died with the VM inside a dead-VM disposal scope;
-        // `T`'s own resources still drop below either way.
-        if !bun_core::dead_vm_scope::in_dead_vm_disposal() {
-            self.0.unprotect();
-        }
+        self.0.unprotect();
         // `self.0: T` drops next (field drop after `Drop::drop`).
     }
 }

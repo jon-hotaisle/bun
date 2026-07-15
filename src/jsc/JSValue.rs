@@ -1618,13 +1618,9 @@ impl JSValue {
     pub fn protect(self) {
         Bun__JSValue__protect(self)
     }
-    /// Inverse of `protect`. No-op inside a dead-VM disposal scope (the
-    /// protect pin died with the VM's heap).
+    /// Inverse of `protect`.
     #[inline]
     pub fn unprotect(self) {
-        if bun_core::dead_vm_scope::in_dead_vm_disposal() {
-            return;
-        }
         Bun__JSValue__unprotect(self)
     }
     /// RAII form of [`protect`]/[`unprotect`]: protects now, unprotects when

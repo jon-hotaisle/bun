@@ -60,6 +60,10 @@ pub struct JSBundleCompletionTask {
     pub config: JSBundlerConfig,
     /// Cross-thread handle to the owning VM; see [`bun_jsc::vm_handle::VMHandle`].
     pub vm: bun_jsc::vm_handle::VMHandle,
+    /// Holds the worker's shutdown gate open from creation until the
+    /// completion is enqueued back (plugin builds drop it in `begin_run` —
+    /// see `CompletionStruct::begin_run`).
+    pub vm_pin: Option<bun_threading::GateGuest>,
     pub task: AnyTask,
     pub global_this: BackRef<JSGlobalObject>,
     pub promise: jsc::JSPromiseStrong,
@@ -85,32 +89,25 @@ impl JSBundleCompletionTask {
     ///
     /// Safe fn: only reachable via the `#[ref_count(destroy = …)]` derive,
     /// whose generated trait `destructor` upholds the sole-owner contract.
+    /// Release a queued-but-unrun completion during the terminate drain
+    /// (JS thread, VM alive): drop the queue's ref like `on_complete_anytask`
+    /// would have.
+    fn release_unrun(this: *mut Self) {
+        // SAFETY: the queue owned this entry; releasing on the JS thread.
+        unsafe { <Self as bun_ptr::AnyRefCounted>::rc_deref(this) };
+    }
+
     fn deinit(this: *mut Self) {
         // SAFETY: refcount hit zero; `this` is the sole owner of a
         // `heap::alloc`'d allocation.
         let mut boxed = unsafe { bun_core::heap::take(this) };
         boxed.poll_ref.disable();
         if let Some(plugin) = boxed.plugins.take() {
-            // The plugin cell died with the VM inside a dead-VM disposal
-            // scope; otherwise this last-ref drop releases the FFI handle.
-            if !bun_core::dead_vm_scope::in_dead_vm_disposal() {
-                Plugin::destroy(plugin.as_ptr());
-            }
+            // `plugin` is the live FFI handle stashed at construction;
+            // last-ref drop is the only place that releases it.
+            Plugin::destroy(plugin.as_ptr());
         }
         // Owned fields (`config`, `log`, `result`, `promise`) drop with the Box.
-    }
-}
-
-// SAFETY: releases the caller's ref inside the dead-VM scope; frees only
-// when no other holder (e.g. an HTMLBundle route in the dead heap) remains.
-unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for JSBundleCompletionTask {
-    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
-        // SAFETY: the JS thread is gone, so this thread is the sole toucher
-        // of the JS-thread-affine refcount. A route-held completion stays
-        // allocated (bounded — it dies with the route's request lifecycle,
-        // which the terminated VM has already abandoned).
-        unsafe { <Self as bun_ptr::AnyRefCounted>::rc_deref(this) };
     }
 }
 
@@ -136,6 +133,7 @@ pub(crate) fn create_and_schedule_completion_task(
         ref_count: RefCount::init(),
         config,
         vm: global_this.bun_vm().cross_thread_handle(),
+        vm_pin: None,
         task: AnyTask::default(),
         global_this: BackRef::new(global_this),
         promise: jsc::JSPromiseStrong::default(),
@@ -152,12 +150,12 @@ pub(crate) fn create_and_schedule_completion_task(
     }));
     // SAFETY: freshly-boxed allocation with ref_count == 1; sole handle.
     unsafe {
-        (*completion).task =
-            AnyTask::from_typed_with_dispose(
-                completion,
-                JSBundleCompletionTask::on_complete_anytask,
-                <JSBundleCompletionTask as bun_jsc::vm_handle::DisposeAfterVmDestroyed>::dispose_after_vm_destroyed,
-            );
+        (*completion).vm_pin = Some((*completion).vm.pin());
+        (*completion).task = AnyTask::from_typed_with_dispose(
+            completion,
+            JSBundleCompletionTask::on_complete_anytask,
+            JSBundleCompletionTask::release_unrun,
+        );
         if let Some(plugin) = (*completion).plugins {
             (*plugin.as_ptr()).set_config(completion.cast());
         }
@@ -1024,39 +1022,33 @@ impl CompletionStruct for JSBundleCompletionTask {
         Ok(())
     }
 
-    fn pin_vm_for_bundle(&self) -> bun_bundler::BundleThread::BundlePin {
-        use bun_bundler::BundleThread::BundlePin;
-        match self.vm.pin_for_bounded_work() {
-            // See `BundlePin::Unpinned` — plugin builds round-trip through
-            // the owning JS thread mid-bundle, so holding the pin would
-            // deadlock worker terminate.
-            Some(guard) if self.plugins.is_some() => {
-                drop(guard);
-                BundlePin::Unpinned
-            }
-            Some(guard) => BundlePin::Pinned(guard),
-            None => BundlePin::VmGone,
+    fn begin_run(&mut self) {
+        if self.plugins.is_some() {
+            // Plugin builds round-trip through the owning JS thread
+            // mid-bundle; holding the pin would deadlock worker terminate.
+            drop(self.vm_pin.take());
         }
     }
 
     fn complete_on_bundle_thread(&mut self) {
-        // On success, `ConcurrentTask::create` heap-allocates a fresh task and
-        // the queue takes ownership; on `false` (worker VM destroyed) the
-        // completion is freed here — the bundle thread holds the last live
-        // handle and the VM (with its keepalive ref) is gone.
+        // Enqueue while the pin (taken at creation) is still held so it
+        // lands on a live VM, then release it. Unpinned plugin builds can
+        // lose the race with terminate — the completion is leaked with the
+        // wedged bundle (documented residual).
         let vm = self.vm.clone();
         let any_task = self.task.task();
-        if !vm.enqueue_task_concurrent(|| jsc::ConcurrentTask::create(any_task)) {
-            // Owning VM destroyed: the bundle thread holds the last live
-            // reference and this is the run's final completion touch
-            // (`CompletionStruct::complete_on_bundle_thread` contract).
-            // SAFETY: sole owner; nothing touches `self` after this call.
-            unsafe {
-                <Self as bun_jsc::vm_handle::DisposeAfterVmDestroyed>::dispose_after_vm_destroyed(
-                    core::ptr::from_mut(self),
-                );
+        let pin = self.vm_pin.take();
+        match &pin {
+            Some(pin) => {
+                vm.enqueue_task_concurrent_pinned(pin, || jsc::ConcurrentTask::create(any_task));
+            }
+            None => {
+                // Unpinned plugin build: a lost race with terminate leaks the
+                // completion with the wedged bundle (documented residual).
+                let _ = vm.enqueue_task_concurrent(|| jsc::ConcurrentTask::create(any_task));
             }
         }
+        drop(pin);
     }
 
     fn set_result(&mut self, result: BundleV2Result) {

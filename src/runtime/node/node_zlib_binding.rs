@@ -202,9 +202,7 @@ pub(crate) trait CompressionContext {
 // R-2 (host-fn re-entrancy): every JS-exposed mixin method takes `&T`; per-field
 // interior mutability via `Cell` (Copy) / `JsCell` (non-Copy). Accessors return the
 // cell wrapper so the mixin can `.get()`/`.set()`/`.with_mut()` as needed.
-pub(crate) trait CompressionStreamImpl:
-    Sized + Taskable + bun_jsc::vm_handle::DisposeAfterVmDestroyed + 'static
-{
+pub(crate) trait CompressionStreamImpl: Sized + Taskable + 'static {
     type Stream: CompressionContext;
 
     // Field accessors (interior-mutability cells; all `&self`).
@@ -214,6 +212,9 @@ pub(crate) trait CompressionStreamImpl:
     fn global_this(&self) -> &JSGlobalObject;
     /// Cross-thread handle to the owning VM; see `VMHandle`.
     fn vm(&self) -> &bun_jsc::vm_handle::VMHandle;
+    /// Per-write shutdown-gate pin: set on the JS thread in `write()`,
+    /// dropped on the pool thread right after the completion enqueue.
+    fn vm_pin(&self) -> &JsCell<Option<bun_threading::GateGuest>>;
     fn stream(&self) -> &JsCell<Self::Stream>;
 
     /// Write `(avail_out, avail_in)` into the JS-owned 2-element `Uint32Array`
@@ -454,6 +455,9 @@ impl<T: CompressionStreamImpl> CompressionStream<T> {
             callback: Self::async_job_run_task,
         });
         this.poll_ref().with_mut(|p| p.ref_(vm));
+        // Terminate blocks until this write's completion is enqueued.
+        let pin = this.vm().pin();
+        this.vm_pin().with_mut(|slot| *slot = Some(pin));
         WorkPool::schedule(this.task().as_ptr());
 
         Ok(JSValue::UNDEFINED)
@@ -482,14 +486,14 @@ impl<T: CompressionStreamImpl> CompressionStream<T> {
         this_ref.stream().with_mut(|s| s.do_work());
 
         // `this` is the heap `m_ctx` payload, kept alive by `write()`'s ref
-        // until `run_from_js_thread` derefs. On `false` (worker VM destroyed)
-        // it is freed here — the wrapper died with the heap and the write()
-        // ref can never be released.
-        if !vm.enqueue_task_concurrent(|| ConcurrentTask::create(Task::init(this))) {
-            // SAFETY: sole owner — the queue never took the task and no JS
-            // thread exists for this VM anymore.
-            unsafe { T::dispose_after_vm_destroyed(this) };
-        }
+        // until `run_from_js_thread` derefs. The write's pin admits the
+        // enqueue even while terminate is draining; drop it right after.
+        let pin = this_ref
+            .vm_pin()
+            .with_mut(Option::take)
+            .expect("pin taken in write()");
+        vm.enqueue_task_concurrent_pinned(&pin, || ConcurrentTask::create(Task::init(this)));
+        drop(pin);
     }
 
     /// Dispatched from `dispatch.rs` when the worker-thread `do_work()` posts
@@ -976,19 +980,6 @@ macro_rules! __impl_compression_stream {
             const TAG: ::bun_event_loop::TaskTag = ::bun_event_loop::task_tag::$native;
         }
 
-        // SAFETY: releases exactly the write()'s ref per the trait contract.
-        unsafe impl ::bun_jsc::vm_handle::DisposeAfterVmDestroyed for $native {
-            unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-                // Release the in-flight write()'s ref. The count is atomic —
-                // this may race the JS wrapper's finalizer during worker
-                // teardown — and whichever side hits zero frees the payload;
-                // the destroy target's off-JS-thread branch never touches
-                // the dead VM's handle slots.
-                // SAFETY: `this` is live (the write's ref pins it).
-                unsafe { <Self as $crate::node::node_zlib_binding::CompressionStreamImpl>::deref(this) };
-            }
-        }
-
         /// `T.js.*` — cached-property accessors emitted by
         /// `generate-classes.ts` for the `values:` list in `zlib.classes.ts`.
         #[allow(unused)]
@@ -1011,6 +1002,7 @@ macro_rules! __impl_compression_stream {
 
             #[inline] fn global_this(&self) -> &::bun_jsc::JSGlobalObject { self.global_this.get() }
             #[inline] fn vm(&self) -> &::bun_jsc::vm_handle::VMHandle { &self.vm }
+            #[inline] fn vm_pin(&self) -> &JsCell<Option<::bun_threading::GateGuest>> { &self.vm_pin }
             #[inline] fn stream(&self) -> &::bun_jsc::JsCell<Self::Stream> { &self.stream }
             #[inline] fn poll_ref(&self) -> &::bun_jsc::JsCell<$crate::node::node_zlib_binding::CountedKeepAlive> { &self.poll_ref }
             #[inline] fn this_value(&self) -> &::bun_jsc::JsCell<::bun_jsc::StrongOptional> { &self.this_value }

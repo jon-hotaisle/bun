@@ -582,9 +582,8 @@ impl S3BlobStatTask {
     }
 
     /// # Safety
-    /// Dead-VM path only: caller owns `ptr` exclusively and the owning VM
-    /// (and thus `promise`/`global`'s slot storage) is gone.
-    unsafe fn dispose_for_dead_vm(ptr: *mut core::ffi::c_void) {
+    /// Terminate-drain reclaim (JS thread, VM alive): caller owns `ptr`.
+    unsafe fn release_unrun(ptr: *mut core::ffi::c_void) {
         // SAFETY: same heap ctx the callback would have consumed; sole owner
         // (the caller's dead-VM scope forgets the promise slot; store drops).
         drop(unsafe { bun_core::heap::take(ptr.cast::<Self>()) });
@@ -611,7 +610,7 @@ impl S3BlobStatTask {
             path,
             S3BlobStatTask::on_s3_exists_resolved,
             this.cast::<core::ffi::c_void>(),
-            S3BlobStatTask::dispose_for_dead_vm,
+            S3BlobStatTask::release_unrun,
             env.get_http_proxy(true, None, None).map(|proxy| proxy.href),
             s3_store.request_payer,
         )?;
@@ -639,7 +638,7 @@ impl S3BlobStatTask {
             path,
             S3BlobStatTask::on_s3_stat_resolved,
             this.cast::<core::ffi::c_void>(),
-            S3BlobStatTask::dispose_for_dead_vm,
+            S3BlobStatTask::release_unrun,
             env.get_http_proxy(true, None, None).map(|proxy| proxy.href),
             s3_store.request_payer,
         )?;
@@ -667,7 +666,7 @@ impl S3BlobStatTask {
             path,
             S3BlobStatTask::on_s3_size_resolved,
             this.cast::<core::ffi::c_void>(),
-            S3BlobStatTask::dispose_for_dead_vm,
+            S3BlobStatTask::release_unrun,
             env.get_http_proxy(true, None, None).map(|proxy| proxy.href),
             s3_store.request_payer,
         )?;

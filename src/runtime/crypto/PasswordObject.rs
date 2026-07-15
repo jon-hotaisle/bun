@@ -567,6 +567,9 @@ struct PasswordJob<Op: PasswordOp> {
     promise: JSPromiseStrong,
     /// Cross-thread handle to the owning VM; see [`VMHandle`].
     vm: bun_jsc::vm_handle::VMHandle,
+    /// Holds the worker's shutdown gate open until the completion is
+    /// enqueued (dropped on the pool thread in `run_owned`).
+    vm_pin: Option<bun_threading::GateGuest>,
     global: *const JSGlobalObject,
     r#ref: KeepAlive,
     task: WorkPoolTask,
@@ -603,24 +606,19 @@ impl<Op: PasswordOp> PasswordJob<Op> {
             (*result).task = AnyTask::from_typed_with_dispose(
                 result,
                 PasswordResult::<Op>::run_from_js_erased,
-                PasswordResult::<Op>::dispose_after_vm_destroyed,
+                PasswordResult::<Op>::release_unrun,
             );
         }
         // On success, ownership of `result` transfers to the event loop; on
         // `false` (worker VM destroyed) it is leaked per the
         // `VMHandle::enqueue_task_concurrent` policy.
         let vm = self.vm.clone();
-        let queued = vm.enqueue_task_concurrent(|| {
+        let pin = self.vm_pin.take().expect("pin taken at create");
+        vm.enqueue_task_concurrent_pinned(&pin, || {
             // SAFETY: `result` is the live heap allocation initialised above.
             ConcurrentTask::create_from(unsafe { core::ptr::addr_of_mut!((*result).task) })
         });
-        if !queued {
-            // Owning worker VM destroyed: free the result here (the dead-VM
-            // scope forgets the promise slot; owned bytes drop normally).
-            // SAFETY: `result` was just allocated above and never shared (the
-            // enqueue failed), so this thread is the sole owner.
-            unsafe { bun_jsc::vm_handle::dispose_box_for_dead_vm(result) };
-        }
+        drop(pin);
         // `self: Box<Self>` drops here; Drop runs secure_zero on password (+op).
     }
 }
@@ -634,13 +632,11 @@ struct PasswordResult<Op: PasswordOp> {
 }
 
 impl<Op: PasswordOp> PasswordResult<Op> {
-    /// Dead-VM dispose for the queued completion (see `AnyTask::dispose`).
-    ///
-    /// # Safety
-    /// `p` is the queue-owned heap result; the owning worker VM is torn down.
-    unsafe fn dispose_after_vm_destroyed(p: *mut Self) {
-        // SAFETY: sole owner; the scope forgets the promise slot.
-        unsafe { bun_jsc::vm_handle::dispose_box_for_dead_vm(p) };
+    /// Release a queued-but-unrun completion during the terminate drain
+    /// (JS thread, VM alive): plain drop releases everything.
+    fn release_unrun(p: *mut Self) {
+        // SAFETY: queue-owned heap result popped by the drain; sole owner.
+        drop(unsafe { bun_core::heap::take(p) });
     }
 
     fn run_from_js_erased(p: *mut Self) -> AnyTaskJsResult<()> {
@@ -703,11 +699,14 @@ impl JSPasswordObject {
         let promise = JSPromiseStrong::init(global_object);
         let promise_value = promise.value();
 
+        let vm = global_object.bun_vm().cross_thread_handle();
+        let vm_pin = Some(vm.pin());
         let mut job = Box::new(PasswordJob::<Op> {
             op,
             password,
             promise,
-            vm: global_object.bun_vm().cross_thread_handle(),
+            vm,
+            vm_pin,
             global: std::ptr::from_ref(global_object),
             r#ref: KeepAlive::default(),
             task: WorkPoolTask::default(),

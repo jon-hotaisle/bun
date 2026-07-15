@@ -200,7 +200,6 @@ unsafe extern "Rust" {
     /// own JSC handles or whose callback isn't safe to no-op-dispatch).
     /// Defined in `bun_runtime::dispatch`. Link-time resolved.
     fn __bun_release_task_at_shutdown(task: bun_event_loop::Task) -> bool;
-    fn __bun_dispose_task_after_vm_destroyed(task: bun_event_loop::Task) -> bool;
 }
 
 #[inline]
@@ -755,11 +754,45 @@ impl EventLoop {
         self.drop_concurrent_cpp_tasks();
         let mut requeue: Vec<bun_event_loop::Task> = Vec::new();
         while let Some(task) = self.tasks.read_item() {
-            // SAFETY: tag-specific release (drops JSC handles while the VM is
-            // still live); definer in `bun_runtime::dispatch` matches the same
-            // tag set `tick_queue_with_count` does. `false` ⇒ not handled.
-            let consumed = task.tag != bun_event_loop::task_tag::ManagedTask
-                && unsafe { __bun_release_task_at_shutdown(task) };
+            let consumed = match task.tag {
+                // A cleanup-bearing ManagedTask (fetch deferred deinit /
+                // resume) is releasable now, with the VM alive; the plain
+                // ones are owned elsewhere and freed in `deinit`.
+                bun_event_loop::task_tag::ManagedTask => {
+                    // SAFETY: heap_owned (ManagedTask::new -> heap::into_raw).
+                    let managed = unsafe {
+                        bun_core::heap::take(task.ptr.cast::<ManagedTask::ManagedTask>())
+                    };
+                    if let (Some(cleanup), Some(ctx)) = (managed.cleanup, managed.ctx) {
+                        cleanup(ctx.as_ptr());
+                        true
+                    } else {
+                        // Not consumable here — put the box back (re-queued below).
+                        let _ = core::mem::ManuallyDrop::new(managed);
+                        false
+                    }
+                }
+                // A queue-owned AnyTask completion is released via the fn its
+                // producer registered (plain drop — the VM is alive).
+                bun_event_loop::task_tag::AnyTask => {
+                    // SAFETY: `ptr` is the `*mut AnyTask` registered by
+                    // `AnyTask::task()`; copy fields out — `dispose` may free
+                    // the allocation embedding the AnyTask.
+                    let (dispose, ctx) = unsafe {
+                        let any = &*task.ptr.cast::<bun_event_loop::AnyTask::AnyTask>();
+                        (any.dispose, any.ctx)
+                    };
+                    if let (Some(dispose), Some(ctx)) = (dispose, ctx) {
+                        dispose(ctx.as_ptr());
+                        true
+                    } else {
+                        false
+                    }
+                }
+                // SAFETY: tag-specific release (drops JSC handles while the
+                // VM is still live); definer in `bun_runtime::dispatch`.
+                _ => unsafe { __bun_release_task_at_shutdown(task) },
+            };
             if !consumed {
                 requeue.push(task);
             }
@@ -771,13 +804,12 @@ impl EventLoop {
 
     pub fn deinit(&mut self) {
         // Free (don't run — running could re-enter the dying VM) queued
-        // ManagedTask boxes, and dispose `AnyTask`s that carry a dead-VM
-        // dispose. Remaining tags are handed to the per-tag
-        // `__bun_dispose_task_after_vm_destroyed` hook in
-        // `bun_runtime::dispatch`; tags it doesn't claim are dropped from the
-        // queue without freeing their box (owned elsewhere — e.g. CppTasks,
-        // whose `~Ref<Worker>` would walk freed WeakBlock storage; they are
-        // reclaimed before teardown by `release_queued_tasks_for_shutdown`).
+        // ManagedTask boxes. Everything reclaimable was consumed by
+        // `release_queued_tasks_for_shutdown` while the VM was alive (the
+        // producer pin protocol guarantees completions land pre-drain);
+        // anything else here is owned elsewhere and re-queued so it stays
+        // reachable from the static-rooted VM box.
+        let mut requeue: Vec<bun_event_loop::Task> = Vec::new();
         while let Some(task) = self.tasks.read_item() {
             if task.tag == bun_event_loop::task_tag::ManagedTask {
                 // SAFETY: every ManagedTask is heap_owned (ManagedTask::new -> heap::into_raw).
@@ -787,28 +819,20 @@ impl EventLoop {
                     cleanup(ctx.as_ptr());
                 }
                 drop(managed);
-            } else if task.tag == bun_event_loop::task_tag::AnyTask {
-                // Copy the fields out first: `dispose` may free the
-                // allocation the `AnyTask` itself is embedded in.
-                // SAFETY: an AnyTask-tagged `ptr` is the `*mut AnyTask` that
-                // `AnyTask::task()` registered; still live (queue-owned).
-                let (dispose, ctx) = unsafe {
-                    let any = &*task.ptr.cast::<bun_event_loop::AnyTask::AnyTask>();
-                    (any.dispose, any.ctx)
-                };
-                if let (Some(dispose), Some(ctx)) = (dispose, ctx) {
-                    // SAFETY: dispose contract — the owning VM is being torn
-                    // down and the queue owns `ctx`.
-                    unsafe { dispose(ctx.as_ptr()) };
-                }
             } else {
-                // SAFETY: tag-specific dead-VM dispose; definer in
-                // `bun_runtime::dispatch`. `false` ⇒ not claimed (dropped).
-                let _ = unsafe { __bun_dispose_task_after_vm_destroyed(task) };
+                requeue.push(task);
             }
         }
-        // Reassigning a fresh value drops the old buffers in place.
-        self.tasks = Queue::init();
+        if requeue.is_empty() {
+            // Reassigning a fresh value drops the old buffers in place.
+            self.tasks = Queue::init();
+        } else {
+            // Keep the queue (and its buffers) so the re-queued boxes stay
+            // reachable from the static-rooted VM allocation.
+            for task in requeue {
+                let _ = self.tasks.write_item(task);
+            }
+        }
         let pending = core::mem::take(&mut self.immediate_tasks);
         let next = core::mem::take(&mut self.next_immediate_tasks);
         if !pending.is_empty() || !next.is_empty() {

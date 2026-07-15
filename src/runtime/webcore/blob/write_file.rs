@@ -1,4 +1,3 @@
-use bun_sys::FdExt as _;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicU8;
@@ -44,25 +43,6 @@ pub type WriteFileTask = bun_jsc::work_task::WorkTask<WriteFile>;
 impl bun_jsc::work_task::WorkTaskContext for WriteFile {
     const TASK_TAG: bun_event_loop::TaskTag = bun_event_loop::task_tag::WriteFileTask;
 
-    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        // SAFETY: sole owner; the pool run has finished so no io is in
-        // flight. The erased promise ctx is freed by the dispose captured at
-        // creation; the box drops in the caller's scope.
-        unsafe {
-            let file = &mut *this;
-            (file.on_complete_dispose)(file.on_complete_ctx);
-            // Mirror `do_close`: only path-opened fds are ours to close —
-            // fd-backed blobs (`Bun.file(fd)`, stdio) borrow the caller's.
-            if file.is_allowed_to_close()
-                && file.opened_fd != Fd::INVALID
-                && file.opened_fd.stdio_tag().is_none()
-            {
-                let _ = file.opened_fd.close();
-                file.opened_fd = Fd::INVALID;
-            }
-            drop(bun_core::heap::take(this));
-        }
-    }
     fn run(this: *mut Self, task: *mut bun_jsc::work_task::WorkTask<Self>) {
         // SAFETY: WorkTask::run_from_thread_pool guarantees `this` is live.
         unsafe { (*this).run(task) }
@@ -88,8 +68,6 @@ pub struct WriteFile {
 
     pub on_complete_ctx: *mut c_void,
     pub on_complete_callback: WriteFileOnWriteFileCallback,
-    /// Frees `on_complete_ctx` when the owning VM died before completion.
-    pub on_complete_dispose: unsafe fn(*mut c_void),
     pub total_written: usize,
 
     pub could_block: bool,
@@ -307,7 +285,6 @@ impl WriteFile {
         bytes_blob: Blob,
         on_write_file_context: *mut c_void,
         on_complete_callback: WriteFileOnWriteFileCallback,
-        on_complete_dispose: unsafe fn(*mut c_void),
         mkdirp_if_not_exists: bool,
     ) -> Result<*mut WriteFile, Error> {
         let write_file = bun_core::heap::into_raw(Box::new(WriteFile {
@@ -326,7 +303,6 @@ impl WriteFile {
             state: AtomicU8::new(ClosingState::Running as u8),
             on_complete_ctx: on_write_file_context,
             on_complete_callback,
-            on_complete_dispose,
             total_written: 0,
             could_block: false,
             close_after_io: false,
@@ -344,7 +320,6 @@ impl WriteFile {
         bytes_blob: Blob,
         context: *mut C,
         callback: WriteFileOnWriteFileCallback,
-        dispose: unsafe fn(*mut c_void),
         mkdirp_if_not_exists: bool,
     ) -> Result<*mut WriteFile, Error> {
         // The caller supplies a
@@ -355,7 +330,6 @@ impl WriteFile {
             bytes_blob,
             context.cast::<c_void>(),
             callback,
-            dispose,
             mkdirp_if_not_exists,
         )
     }
@@ -1315,12 +1289,6 @@ pub struct WriteFilePromise {
 }
 
 impl WriteFilePromise {
-    /// Dead-VM dispose: the caller's scope forgets the promise handle slot.
-    pub unsafe fn dispose_for_dead_vm(handler: *mut c_void) {
-        // SAFETY: same heap box `run` would have consumed.
-        drop(unsafe { bun_core::heap::take(handler.cast::<Self>()) });
-    }
-
     pub fn run(handler: *mut c_void, count: WriteFileResultType) -> Result<(), JsTerminated> {
         let handler = handler.cast::<Self>();
         // SAFETY: handler is the Box-allocated WriteFilePromise created in

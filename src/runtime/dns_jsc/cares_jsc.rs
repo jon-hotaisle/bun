@@ -722,11 +722,9 @@ impl ErrorDeferred {
         // promise's handle slot died with the VM's HandleSet — forget it;
         // the error strings drop normally.
         fn cleanup(p: *mut core::ffi::c_void) {
-            // SAFETY: `p` is the heap `Context` enqueued below, unrun; the
-            // promise slot died with the VM (dead-VM scope forgets it).
-            unsafe {
-                bun_jsc::vm_handle::dispose_box_for_dead_vm(p.cast::<Context>());
-            }
+            // Reclaimed unrun by the terminate drain (JS thread, VM alive).
+            // SAFETY: `p` is the queue-owned heap `Context`, sole owner.
+            drop(unsafe { bun_core::heap::take(p.cast::<Context>()) });
         }
 
         let context = bun_core::heap::into_raw(Box::new(Context {
