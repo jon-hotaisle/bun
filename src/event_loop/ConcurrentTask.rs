@@ -358,7 +358,9 @@ impl ConcurrentTask {
         cleanup: fn(*mut core::ffi::c_void),
     ) -> core::ptr::NonNull<ConcurrentTask> {
         bun_core::mark_binding!();
-        Self::create(ManagedTask::ManagedTask::new_with_cleanup(ptr, callback, cleanup))
+        Self::create(ManagedTask::ManagedTask::new_with_cleanup(
+            ptr, callback, cleanup,
+        ))
     }
 
     pub fn from<T: Taskable>(

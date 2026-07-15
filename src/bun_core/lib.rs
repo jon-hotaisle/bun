@@ -35,8 +35,8 @@ pub mod compress {
         Error,
     }
 }
-pub mod heap;
 pub mod dead_vm_scope;
+pub mod heap;
 
 pub mod debug;
 pub mod env;
