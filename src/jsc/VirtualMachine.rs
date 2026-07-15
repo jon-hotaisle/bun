@@ -289,9 +289,8 @@ pub struct VirtualMachine {
     /// Worker terminate / process exit walks this so the HTTP side finishes
     /// promptly and its producer pins drop. Producers register at creation
     /// and unregister (by ctx) when the JS side consumes the completion.
-    pub terminate_abort_registry: core::cell::RefCell<
-        Vec<(*mut core::ffi::c_void, unsafe fn(*mut core::ffi::c_void))>,
-    >,
+    pub terminate_abort_registry:
+        core::cell::RefCell<Vec<(*mut core::ffi::c_void, unsafe fn(*mut core::ffi::c_void))>>,
 
     pub ref_strings: crate::ref_string::Map,
     pub ref_strings_mutex: bun_threading::Mutex,

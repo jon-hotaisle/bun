@@ -3153,7 +3153,6 @@ extern "C" void NapiEnv__deref(napi_env env)
     env->deref();
 }
 
-
 }
 
 // Defined out-of-line so its uses of DECLARE_TOP_EXCEPTION_SCOPE (whose

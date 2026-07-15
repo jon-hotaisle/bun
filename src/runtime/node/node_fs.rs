@@ -2599,7 +2599,9 @@ mod _async_tasks {
             let vm = self.vm.clone();
             let this_ptr = std::ptr::from_mut::<Self>(self);
             let pin = self.vm_pin.take().expect("pin taken at create");
-            vm.enqueue_task_concurrent_pinned(&pin, || ConcurrentTask::create(Task::init(this_ptr)));
+            vm.enqueue_task_concurrent_pinned(&pin, || {
+                ConcurrentTask::create(Task::init(this_ptr))
+            });
             drop(pin);
         }
 

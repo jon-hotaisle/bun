@@ -719,9 +719,10 @@ pub(crate) fn execute_simple_s3_request(
         },
     ));
     // Terminate/exit can abort this transfer while the VM is alive.
-    vm.terminate_abort_registry
-        .borrow_mut()
-        .push((task_ptr.cast(), S3HttpSimpleTask::abort_for_terminate_erased));
+    vm.terminate_abort_registry.borrow_mut().push((
+        task_ptr.cast(),
+        S3HttpSimpleTask::abort_for_terminate_erased,
+    ));
     // queue http request
     bun_http::http_thread::init(&Default::default());
     let mut batch = thread_pool::Batch::default();

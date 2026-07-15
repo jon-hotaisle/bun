@@ -1213,9 +1213,9 @@ pub(crate) fn __bun_release_task_at_shutdown(task: bun_event_loop::Task) -> bool
             let s3 = task.ptr.cast::<S3HttpDownloadStreamingTask>();
             // SAFETY: queue-owned entry, live box.
             unsafe {
-                if crate::webcore::s3::download_stream::State((*s3).state.load(
-                    core::sync::atomic::Ordering::Acquire,
-                ))
+                if crate::webcore::s3::download_stream::State(
+                    (*s3).state.load(core::sync::atomic::Ordering::Acquire),
+                )
                 .has_more()
                 {
                     return false;
@@ -1241,17 +1241,23 @@ pub(crate) fn __bun_release_task_at_shutdown(task: bun_event_loop::Task) -> bool
         }
         task_tag::NativeZlib => {
             // SAFETY: releases the in-flight write()'s ref on the JS thread.
-            unsafe { <NativeZlib as node_zlib_binding::CompressionStreamImpl>::deref(task.ptr.cast()) };
+            unsafe {
+                <NativeZlib as node_zlib_binding::CompressionStreamImpl>::deref(task.ptr.cast())
+            };
             true
         }
         task_tag::NativeBrotli => {
             // SAFETY: as NativeZlib above.
-            unsafe { <NativeBrotli as node_zlib_binding::CompressionStreamImpl>::deref(task.ptr.cast()) };
+            unsafe {
+                <NativeBrotli as node_zlib_binding::CompressionStreamImpl>::deref(task.ptr.cast())
+            };
             true
         }
         task_tag::NativeZstd => {
             // SAFETY: as NativeZlib above.
-            unsafe { <NativeZstd as node_zlib_binding::CompressionStreamImpl>::deref(task.ptr.cast()) };
+            unsafe {
+                <NativeZstd as node_zlib_binding::CompressionStreamImpl>::deref(task.ptr.cast())
+            };
             true
         }
         task_tag::AsyncGlobWalkTask => {
