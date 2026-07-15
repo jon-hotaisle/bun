@@ -185,6 +185,11 @@ impl<T> Drop for Weak<T> {
             return;
         };
         self.r#ref = None;
+        // Forgotten inside a dead-VM disposal scope — the WeakImpl (and its
+        // registered finalizer) died with the VM's WeakSet.
+        if bun_core::dead_vm_scope::in_dead_vm_disposal() {
+            return;
+        }
         // SAFETY: `r#ref` was live; we just took ownership and are deleting it.
         unsafe { WeakImpl::destroy(r#ref) };
     }

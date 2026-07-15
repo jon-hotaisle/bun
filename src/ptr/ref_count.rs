@@ -397,6 +397,11 @@ impl<T: RefCounted> RefCount<T> {
     }
 
     fn assert_single_threaded(&self) {
+        // A dead-VM disposal legitimately releases the last ref from another
+        // thread — the owning JS thread is gone, so it is the sole toucher.
+        if bun_core::dead_vm_scope::in_dead_vm_disposal() {
+            return;
+        }
         self.thread.lock_or_assert();
     }
 

@@ -18,13 +18,10 @@ pub trait ConcurrentPromiseTaskContext: Sized {
     fn run(&mut self);
     fn then(&mut self, promise: &mut JSPromise) -> Result<(), JsTerminated>;
 
-    /// Consume the context after its owning VM was destroyed (see
-    /// [`crate::vm_handle::DisposeAfterVmDestroyed`]): forget JSC handle
-    /// fields, free everything else.
-    ///
-    /// # Safety
-    /// The owning VM is gone; must not touch it or its loop.
-    unsafe fn dispose_for_dead_vm(self);
+    /// Release resources with no drop glue (raw fds, refcounts without
+    /// `Drop`) before the dead-VM disposal drop; handle slots and protect
+    /// pins are forgotten by the scope. Default: nothing extra.
+    fn dispose_extras_for_dead_vm(&mut self) {}
 }
 
 /// A generic task that runs work on a thread pool and resolves a JavaScript Promise with the result.
@@ -61,18 +58,17 @@ impl<Context: ConcurrentPromiseTaskContext> Taskable for ConcurrentPromiseTask<'
     const TAG: TaskTag = Context::TASK_TAG;
 }
 
-// SAFETY: frees `this` exactly once per the trait contract.
+// SAFETY: plain drop in the dead-VM scope, after the ctx releases its
+// non-Drop resources.
 unsafe impl<Context: ConcurrentPromiseTaskContext> crate::vm_handle::DisposeAfterVmDestroyed
     for ConcurrentPromiseTask<'_, Context>
 {
     unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        // SAFETY: sole owner; ManuallyDrop suppresses the promise's dead
-        // handle-slot release. `ctx` and the gate Arc are read out once.
-        let task = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
-        // SAFETY: each field is read out exactly once from the suppressed value.
+        let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
+        // SAFETY: sole owner per the trait contract.
         unsafe {
-            Context::dispose_for_dead_vm(*core::ptr::read(&raw const task.ctx));
-            drop(core::ptr::read(&raw const task.vm));
+            (*this).ctx.dispose_extras_for_dead_vm();
+            drop(bun_core::heap::take(this));
         }
     }
 }

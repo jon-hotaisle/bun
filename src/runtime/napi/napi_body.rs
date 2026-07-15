@@ -147,6 +147,13 @@ unsafe impl bun_ptr::ExternalSharedDescriptor for NapiEnv {
         unsafe { NapiEnv__ref(this) }
     }
     unsafe fn ext_deref(this: *mut Self) {
+        // Inside a dead-VM disposal scope the pending-exception slot died
+        // with the VM; the C++ helper neutralizes it before deref'ing.
+        if bun_core::dead_vm_scope::in_dead_vm_disposal() {
+            // SAFETY: caller contract — `this` is a valid C++-owned napi_env.
+            unsafe { NapiEnv__derefAfterVmDestroyed(this) };
+            return;
+        }
         // SAFETY: caller contract — `this` is a valid C++-owned napi_env.
         unsafe { NapiEnv__deref(this) }
     }
@@ -1740,20 +1747,10 @@ pub struct napi_async_work {
 
 bun_threading::intrusive_work_task!(napi_async_work, task);
 
-// SAFETY: frees `this` exactly once per the trait contract.
-unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for napi_async_work {
-    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        // SAFETY: sole owner. The C++ helper neutralizes the env's pending-
-        // exception slot (died with the VM) before deref'ing; `data` stays
-        // addon-owned, same contract as Node when a worker dies mid-work.
-        let work = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
-        // SAFETY: env ptr is live (our ref); vm Arc read out exactly once.
-        unsafe {
-            NapiEnv__derefAfterVmDestroyed(work.env.as_ptr());
-            drop(core::ptr::read(&raw const work.vm));
-        }
-    }
-}
+// SAFETY: plain drop in the dead-VM scope — the env ref's release routes
+// through the scope-aware `ext_deref`; `data` stays addon-owned, same
+// contract as Node when a worker dies mid-work.
+unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for napi_async_work {}
 
 impl napi_async_work {
     pub fn new(

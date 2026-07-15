@@ -38,14 +38,6 @@ pub trait AnyTaskJobCtx: Sized {
     /// loop, unless the VM is already shutting down. Any `Err` is surfaced as
     /// the `AnyTask` callback's result (i.e. propagated to the tick loop).
     fn then(&mut self, global: &JSGlobalObject) -> JsResult<()>;
-
-    /// Consume the ctx after the owning VM was destroyed (see
-    /// [`crate::vm_handle::DisposeAfterVmDestroyed`]): forget JSC handle
-    /// fields, free everything else. Runs off the JS thread.
-    ///
-    /// # Safety
-    /// The owning VM is gone; must not touch it or its loop.
-    unsafe fn dispose_for_dead_vm(self);
 }
 
 /// Heap-allocated `{WorkPoolTask, AnyTask, KeepAlive, ctx}` bundle. Created
@@ -66,20 +58,10 @@ pub struct AnyTaskJob<C> {
 
 bun_threading::intrusive_work_task!([C] AnyTaskJob<C>, task);
 
-// SAFETY: frees `this` exactly once per the trait contract.
-unsafe impl<C: AnyTaskJobCtx> crate::vm_handle::DisposeAfterVmDestroyed for AnyTaskJob<C> {
-    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        // SAFETY: sole owner; ManuallyDrop bypasses `Drop for AnyTaskJob`
-        // (its `poll.unref` reads the discovering thread's js_vm_ctx TLS) and
-        // the ctx field drop glue — the ctx is consumed by its own dispose.
-        let job = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
-        // SAFETY: each field is read out exactly once from the suppressed value.
-        unsafe {
-            C::dispose_for_dead_vm(core::ptr::read(&raw const job.ctx));
-            drop(core::ptr::read(&raw const job.vm));
-        }
-    }
-}
+// SAFETY: plain drop in the dead-VM scope — the job's own Drop and every
+// ctx's release paths (protect pins, handle slots, C++ deinits) are
+// scope-aware.
+unsafe impl<C: AnyTaskJobCtx> crate::vm_handle::DisposeAfterVmDestroyed for AnyTaskJob<C> {}
 
 impl<C> Drop for AnyTaskJob<C> {
     #[inline]

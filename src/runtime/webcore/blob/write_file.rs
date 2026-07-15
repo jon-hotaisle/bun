@@ -46,22 +46,21 @@ impl bun_jsc::work_task::WorkTaskContext for WriteFile {
 
     unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
         // SAFETY: sole owner; the pool run has finished so no io is in
-        // flight. The Blob views' store derefs are process-heap; the fd (if
-        // opened) is closed; the erased promise ctx is freed by the dispose
-        // captured at creation.
-        let file = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
-        // SAFETY: each owned field is read out exactly once (ManuallyDrop).
+        // flight. The erased promise ctx is freed by the dispose captured at
+        // creation; the box drops in the caller's scope.
         unsafe {
+            let file = &mut *this;
             (file.on_complete_dispose)(file.on_complete_ctx);
-            drop(core::ptr::read(&raw const file.file_blob));
-            drop(core::ptr::read(&raw const file.bytes_blob));
-            let _ = core::ptr::read(&raw const file.system_error);
             // Mirror `do_close`: only path-opened fds are ours to close —
             // fd-backed blobs (`Bun.file(fd)`, stdio) borrow the caller's.
-            let fd = core::ptr::read(&raw const file.opened_fd);
-            if file.is_allowed_to_close() && fd != Fd::INVALID && fd.stdio_tag().is_none() {
-                let _ = fd.close();
+            if file.is_allowed_to_close()
+                && file.opened_fd != Fd::INVALID
+                && file.opened_fd.stdio_tag().is_none()
+            {
+                let _ = file.opened_fd.close();
+                file.opened_fd = Fd::INVALID;
             }
+            drop(bun_core::heap::take(this));
         }
     }
     fn run(this: *mut Self, task: *mut bun_jsc::work_task::WorkTask<Self>) {
@@ -1316,11 +1315,10 @@ pub struct WriteFilePromise {
 }
 
 impl WriteFilePromise {
-    /// Dead-VM dispose: the promise handle slot died with the VM's HandleSet.
+    /// Dead-VM dispose: the caller's scope forgets the promise handle slot.
     pub unsafe fn dispose_for_dead_vm(handler: *mut c_void) {
         // SAFETY: same heap box `run` would have consumed.
-        let b = unsafe { bun_core::heap::take(handler.cast::<Self>()) };
-        let _ = core::mem::ManuallyDrop::new(*b);
+        drop(unsafe { bun_core::heap::take(handler.cast::<Self>()) });
     }
 
     pub fn run(handler: *mut c_void, count: WriteFileResultType) -> Result<(), JsTerminated> {

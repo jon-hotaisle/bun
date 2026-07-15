@@ -296,35 +296,25 @@ mod _impl {
         /// Safe fn: only reachable via the `#[ref_count(destroy = …)]` derive,
         /// whose generated trait `destroy` upholds the sole-owner contract.
         fn destroy_on_zero(this: *mut Self) {
-            // Off the JS thread (worker terminated — a work-pool completion
-            // held the last ref) the handle slots died with the VM and must
-            // be forgotten, not released; the brotli state still closes.
-            // SAFETY: refcount hit zero ⇒ sole owner.
-            let vm_gone = unsafe { (*this).vm.with(|_| ()).is_none() };
-            // Gate closed ⇒ owning VM torn down: forget the dead handle
-            // slots instead of releasing them (see NativeZlib::deinit).
-            if vm_gone {
-                // SAFETY: refcount hit zero ⇒ sole owner; Box from `constructor`.
-                unsafe {
+            // Gate closed ⇒ owning VM torn down: drop inside the dead-VM
+            // scope so the handle slots and loop ref are forgotten, not
+            // released (see NativeZlib::deinit); brotli state still closes.
+            // SAFETY: refcount hit zero ⇒ sole owner; Box from `constructor`.
+            unsafe {
+                if (*this).vm.with(|_| ()).is_none() {
+                    let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
                     (*this).stream.with_mut(|s| match s.mode {
                         bun_zlib::NodeMode::BROTLI_ENCODE | bun_zlib::NodeMode::BROTLI_DECODE => {
                             s.close();
                         }
                         _ => {}
                     });
-                    let boxed = bun_core::heap::take(this);
-                    let _ =
-                        core::mem::ManuallyDrop::new(boxed.this_value.replace(Default::default()));
-                    let _ =
-                        core::mem::ManuallyDrop::new(boxed.poll_ref.replace(Default::default()));
-                    drop(boxed);
+                    drop(bun_core::heap::take(this));
+                    return;
                 }
-                return;
+                (*this).deinit();
+                drop(bun_core::heap::take(this));
             }
-            // SAFETY: refcount hit zero ⇒ no other borrow remains.
-            unsafe { (*this).deinit() };
-            // SAFETY: allocated via `Box::new` in `constructor`.
-            drop(unsafe { bun_core::heap::take(this) });
         }
 
         /// RefCount destructor body (called when ref_count → 0).

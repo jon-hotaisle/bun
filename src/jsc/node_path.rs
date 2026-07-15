@@ -68,22 +68,14 @@ impl<T: Unprotect> core::ops::DerefMut for ThreadSafe<T> {
     }
 }
 
-impl<T: Unprotect> ThreadSafe<T> {
-    /// Unwrap without running the `unprotect` — for disposal after the
-    /// owning VM was destroyed: the protect slot died with the VM's heap,
-    /// while `T`'s own resources must still drop.
-    #[inline]
-    pub fn into_inner_for_dead_vm(self) -> T {
-        let this = core::mem::ManuallyDrop::new(self);
-        // SAFETY: `this` is never dropped (ManuallyDrop) so `T` is read once.
-        unsafe { core::ptr::read(&raw const this.0) }
-    }
-}
-
 impl<T: Unprotect> Drop for ThreadSafe<T> {
     #[inline]
     fn drop(&mut self) {
-        self.0.unprotect();
+        // The protect pin died with the VM inside a dead-VM disposal scope;
+        // `T`'s own resources still drop below either way.
+        if !bun_core::dead_vm_scope::in_dead_vm_disposal() {
+            self.0.unprotect();
+        }
         // `self.0: T` drops next (field drop after `Drop::drop`).
     }
 }

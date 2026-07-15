@@ -1142,14 +1142,10 @@ mod _async_tasks {
     pub trait FsReturn {
         fn fs_to_js(&mut self, global: &JSGlobalObject) -> JsResult<JSValue>;
 
-        /// Release the result when its owning VM was destroyed before
-        /// `fs_to_js` could run. Default: plain drop (owned process heap).
-        /// Overridden where the result owns an fd or refcounted strings.
-        fn dispose_for_dead_vm(self)
-        where
-            Self: Sized,
-        {
-        }
+        /// Release result resources with no drop glue (fds, `Buffer` bytes,
+        /// `BunString`/`Dirent` refs) when the owning VM died before
+        /// `fs_to_js` could run; the rest drops normally. Default: nothing.
+        fn release_for_dead_vm(&mut self) {}
     }
     impl FsReturn for JSValue {
         #[inline]
@@ -1186,9 +1182,12 @@ mod _async_tasks {
         fn fs_to_js(&mut self, global: &JSGlobalObject) -> JsResult<JSValue> {
             Ok(crate::node::types::FdJsc::to_js(*self, global))
         }
-        fn dispose_for_dead_vm(self) {
+        fn release_for_dead_vm(&mut self) {
             // A successful async open() owns this fd; nothing will consume it.
-            let _ = self.close();
+            let fd = core::mem::replace(self, FD::INVALID);
+            if fd != FD::INVALID {
+                let _ = fd.close();
+            }
         }
     }
     impl FsReturn for StringOrBuffer {
@@ -1196,10 +1195,10 @@ mod _async_tasks {
         fn fs_to_js(&mut self, global: &JSGlobalObject) -> JsResult<JSValue> {
             self.to_js(global)
         }
-        fn dispose_for_dead_vm(mut self) {
+        fn release_for_dead_vm(&mut self) {
             // `Drop` releases the string arms; the Buffer arm's owned bytes
             // are only freed by `destroy()` (normally consumed by `to_js`).
-            if let StringOrBuffer::Buffer(b) = &mut self {
+            if let StringOrBuffer::Buffer(b) = self {
                 b.destroy();
             }
         }
@@ -1236,10 +1235,10 @@ mod _async_tasks {
             let owned = core::mem::replace(self, ret::Readdir::Files(Box::default()));
             owned.to_js(global)
         }
-        fn dispose_for_dead_vm(mut self) {
+        fn release_for_dead_vm(&mut self) {
             // Mirrors `ResultListEntryValue::deinit`: entries carry WTF string
             // refs / owned buffer bytes that plain drop would leak.
-            match &mut self {
+            match self {
                 ret::Readdir::WithFileTypes(res) => {
                     for item in res.iter() {
                         item.deref();
@@ -1275,29 +1274,19 @@ mod _async_tasks {
         const TAG: bun_event_loop::TaskTag = F.task_tag();
     }
 
-    // SAFETY: frees `this` exactly once per the trait contract.
+    // SAFETY: plain drop in the dead-VM scope, after the result releases its
+    // non-Drop resources (fds, buffer bytes, string refs).
     unsafe impl<R: FsReturn, A: Unprotect, const F: NodeFSFunctionEnum>
         bun_jsc::vm_handle::DisposeAfterVmDestroyed for AsyncFSTask<R, A, F>
     {
         unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
+            let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
             // SAFETY: caller owns `this` exclusively (Box::leak'd in create()).
-            // Moving out of the Box frees the box allocation; `ManuallyDrop`
-            // suppresses field drop glue so the promise's dead handle slot is
-            // never touched. Every owned field is read out exactly once below.
-            let task = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
-            // SAFETY: each owned field is read out exactly once (ManuallyDrop).
             unsafe {
-                // Skip the args' unprotect (the protect slot died with the
-                // heap) while still dropping their owned buffers.
-                drop(core::ptr::read(&raw const task.args).into_inner_for_dead_vm());
-                // Result-specific release (fds closed, string refs deref'd).
-                match core::ptr::read(&raw const task.result) {
-                    Ok(r) => r.dispose_for_dead_vm(),
-                    Err(e) => drop(e),
+                if let Ok(r) = &mut (*this).result {
+                    r.release_for_dead_vm();
                 }
-                // Release the gate Arc; `promise` and the rest are forgotten
-                // (handle slot / raw pointers into the dead VM).
-                drop(core::ptr::read(&raw const task.vm));
+                drop(bun_core::heap::take(this));
             }
         }
     }
@@ -2281,20 +2270,16 @@ mod _async_tasks {
 
     bun_threading::intrusive_work_task!(AsyncReaddirRecursiveTask, task);
 
-    // SAFETY: frees `this` exactly once per the trait contract.
+    // SAFETY: plain drop in the dead-VM scope, after releasing the non-Drop
+    // resources (entry refs/bytes, queued entry boxes, the root fd).
     unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for AsyncReaddirRecursiveTask {
         unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-            // SAFETY: caller owns `this` exclusively; ManuallyDrop suppresses
-            // field drop glue (dead promise slot, args unprotect); every owned
-            // field is read out exactly once below.
-            let task = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
-            // SAFETY: each owned field is read out exactly once (ManuallyDrop).
+            let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
+            // SAFETY: caller owns `this` exclusively.
             unsafe {
-                drop(core::ptr::read(&raw const task.args).into_inner_for_dead_vm());
-                let mut result_list = core::ptr::read(&raw const task.result_list);
-                result_list.deinit();
-                let queue = core::ptr::read(&raw const task.result_list_queue);
-                let mut batch = queue.pop_batch().iterator();
+                let task = &mut *this;
+                task.result_list.deinit();
+                let mut batch = task.result_list_queue.pop_batch().iterator();
                 loop {
                     let entry = batch.next();
                     if entry.is_null() {
@@ -2304,13 +2289,11 @@ mod _async_tasks {
                     entry.value.deinit();
                     drop(entry);
                 }
-                let root_fd = core::ptr::read(&raw const task.root_fd);
+                let root_fd = core::mem::replace(&mut task.root_fd, FD::INVALID);
                 if root_fd != FD::INVALID {
                     let _ = root_fd.close();
                 }
-                drop(core::ptr::read(&raw const task.root_path));
-                drop(core::ptr::read(&raw const task.pending_err));
-                drop(core::ptr::read(&raw const task.vm));
+                drop(bun_core::heap::take(this));
             }
         }
     }

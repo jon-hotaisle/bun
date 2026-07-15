@@ -5273,12 +5273,20 @@ pub(crate) static __BUN_LOADER_HOOKS: LoaderHooks = LoaderHooks {
 #[unsafe(no_mangle)]
 pub(crate) fn __bun_get_vm_ctx(kind: bun_io::AllocatorType) -> bun_io::EventLoopCtx {
     match kind {
-        // SAFETY: `get_mut_ptr()` is the live per-thread VM singleton.
-        bun_io::AllocatorType::Js => unsafe {
-            bun_jsc::virtual_machine::VirtualMachine::event_loop_ctx(
-                bun_jsc::virtual_machine::VirtualMachine::get_mut_ptr(),
-            )
-        },
+        bun_io::AllocatorType::Js => {
+            // Dead-VM disposal runs on threads with no VM; hand back an inert
+            // ctx — every consumer (`KeepAlive::unref` etc.) no-ops in the
+            // scope before touching it.
+            let vm = if bun_core::dead_vm_scope::in_dead_vm_disposal() {
+                bun_jsc::virtual_machine::VirtualMachine::get_or_null()
+                    .unwrap_or(core::ptr::null_mut())
+            } else {
+                bun_jsc::virtual_machine::VirtualMachine::get_mut_ptr()
+            };
+            // SAFETY: outside the disposal scope this is the live per-thread
+            // VM singleton; inside it the ctx is never dereferenced.
+            unsafe { bun_jsc::virtual_machine::VirtualMachine::event_loop_ctx(vm) }
+        }
         bun_io::AllocatorType::Mini => {
             // SAFETY: `GLOBAL` is set by `MiniEventLoop::init_global` before
             // any caller asks for `AllocatorType::Mini` (the global mini loop

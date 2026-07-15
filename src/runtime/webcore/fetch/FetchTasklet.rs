@@ -405,7 +405,11 @@ impl FetchTasklet {
         // `from_callback` heap-allocates a fresh `ConcurrentTaskItem`; the queue
         // takes ownership of it.
         let enqueued = Self::enqueue_concurrent(&vm, || {
-            ConcurrentTask::from_callback(this, FetchTasklet::deinit_callback)
+            ConcurrentTask::from_callback_with_cleanup(
+                this,
+                FetchTasklet::deinit_callback,
+                FetchTasklet::deinit_dead_vm_cleanup,
+            )
         });
         if enqueued != Some(true) {
             // `dealloc_for_shutdown` parks main-VM boxes for the exit drain
@@ -537,12 +541,29 @@ impl FetchTasklet {
             http::defer_shutdown_reclaim(this.cast(), FetchTasklet::deinit_erased);
             return;
         }
-        // Worker terminate: `detach_for_worker_terminate` already released
-        // every JSC handle on the JS thread (its registry ref made reaching
-        // zero impossible before the walk ran), so this deinit only frees
-        // process-heap state and is safe off-thread.
+        // Worker terminate: run the deinit inside the dead-VM scope — the
+        // JSC handles were released on the JS thread by the `is_done` path or
+        // the terminate walk, and any straggler slots (a pending promise from
+        // the early-shutdown path, the response WeakImpl) are forgotten by
+        // the scope instead of touching the dying heap.
+        let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
         // SAFETY: last ref per the caller contract.
         unsafe { FetchTasklet::deinit(this) };
+    }
+
+    /// `ManagedTask` cleanup for a deinit task reclaimed unrun at worker
+    /// teardown: the ref count is already zero, free in the dead-VM scope.
+    fn deinit_dead_vm_cleanup(this: *mut c_void) {
+        let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
+        // SAFETY: enqueued by `deref_from_thread` with the last ref released.
+        unsafe { FetchTasklet::deinit(this.cast()) };
+    }
+
+    /// `ManagedTask` cleanup for a resume task reclaimed unrun at worker
+    /// teardown: releases the ref its enqueue closure took.
+    fn deref_dead_vm_cleanup(this: *mut c_void) {
+        let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
+        FetchTasklet::deref(this.cast());
     }
 
     unsafe fn deinit_erased(this: *mut c_void) {
@@ -1157,9 +1178,9 @@ impl FetchTasklet {
                     reject_erased
                 },
                 |p| {
-                    // The handle slots died with the VM; the box is queue-owned.
-                    let h = core::mem::ManuallyDrop::new(*bun_core::heap::take(p));
-                    let _ = &h;
+                    // Queue-owned box; the scope forgets its handle slots.
+                    // SAFETY: dispose contract — sole owner, VM torn down.
+                    bun_jsc::vm_handle::dispose_box_for_dead_vm(p);
                 },
             );
             (*vm.event_loop()).enqueue_task(Task::init(&raw mut (*holder).task));
@@ -2173,9 +2194,15 @@ impl FetchTasklet {
         // `from_callback` heap-allocates a fresh `ConcurrentTaskItem`; the queue
         // takes ownership of it.
         let _ = Self::enqueue_concurrent(&vm, || {
-            // ref until the main thread callback is called
+            // ref until the main thread callback is called; released by the
+            // callback or, if the task is reclaimed unrun at teardown, by the
+            // cleanup below.
             this_ref.ref_();
-            ConcurrentTask::from_callback(this, FetchTasklet::resume_request_data_stream)
+            ConcurrentTask::from_callback_with_cleanup(
+                this,
+                FetchTasklet::resume_request_data_stream,
+                FetchTasklet::deref_dead_vm_cleanup,
+            )
         });
     }
 
@@ -2394,6 +2421,12 @@ impl FetchTasklet {
         // SAFETY: caller contract.
         let t = unsafe { &mut *this };
         t.abort_task();
+        // A streaming request body holds a `start_request_stream` ref that
+        // only `write_end_request` (via the sink's on_end) releases — cancel
+        // the sink like the normal `is_done` path does, while JS is alive.
+        if let Some(sink) = t.sink_mut() {
+            sink.cancel(JSValue::UNDEFINED);
+        }
         t.clear_stream_handlers();
         t.readable_stream_ref.deinit();
         // Replacing runs the old Weak's Drop here on the JS thread, which

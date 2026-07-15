@@ -373,27 +373,19 @@ unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for S3HttpDownloadStream
             }
             return;
         }
-        // SAFETY: final callback — sole owner. `ManuallyDrop` suppresses
-        // `Drop` (its `poll_ref.unref` would touch the dead VM's loop).
-        let mut task = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
-        // SAFETY: fields are read out of the suppressed value exactly once.
+        // Barrier: a losing CAS callback may still be inside its
+        // mutex-guarded buffer append; taking the lock once proves it left.
+        // SAFETY: `this` is live until the take below.
         unsafe {
-            (task.callback_context_dispose)(task.callback_context.as_ptr().cast());
-            // Mirror `Drop`'s http cleanup (transfer is done, so the HTTP
-            // thread no longer aliases these buffers).
-            let http = task.http.assume_init_mut();
-            http.clear_data();
-            http.request_headers = Default::default();
-            http.client.header_entries = Default::default();
-            // Owned process-heap fields; `poll_ref` (no Drop), atomics,
-            // `mutex`, `signals` and the fn pointers have no drop glue.
-            drop(core::ptr::read(&raw const task.sign_result));
-            drop(core::ptr::read(&raw const task.headers));
-            drop(core::ptr::read(&raw const task.response_buffer));
-            drop(core::ptr::read(&raw const task.reported_response_buffer));
-            drop(core::ptr::read(&raw const task.range));
-            drop(core::ptr::read(&raw const task.proxy_url));
-            drop(core::ptr::read(&raw const task.vm));
+            (*this).mutex.lock();
+            (*this).mutex.unlock();
+        }
+        let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
+        // SAFETY: final callback — sole owner; `Drop` handles the http
+        // cleanup (its loop unref no-ops inside the scope).
+        unsafe {
+            ((*this).callback_context_dispose)((*this).callback_context.as_ptr().cast());
+            drop(bun_core::heap::take(this));
         }
     }
 }

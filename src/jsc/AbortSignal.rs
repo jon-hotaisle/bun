@@ -226,6 +226,12 @@ unsafe impl bun_ptr::ExternalSharedDescriptor for AbortSignal {
     }
     #[inline]
     unsafe fn ext_deref(this: *mut Self) {
+        // Inside a dead-VM disposal scope the non-atomic WebCore refcount
+        // would race the dying worker's own releases — forget the ref (the
+        // C++ box is bounded by the wrapper lifecycle that died with the VM).
+        if bun_core::dead_vm_scope::in_dead_vm_disposal() {
+            return;
+        }
         // `opaque_ref` is the centralised ZST-handle deref proof; C++ frees
         // the object iff the count reaches zero.
         WebCore__AbortSignal__unref(Self::opaque_ref(this));

@@ -97,12 +97,9 @@ pub trait ReadFileCompletion {
 
 impl<'a, F: ReadFileToJs> ReadFileCompletion for NewReadFileHandler<'a, F> {
     unsafe fn dispose_for_dead_vm(ctx: *mut Self) {
-        // SAFETY: same heap allocation `run` would have consumed. The promise
-        // slot died with the VM's HandleSet; the Blob's store deref and name
-        // release are process-heap only.
-        let handler = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(ctx) });
-        // SAFETY: same heap box `run` would have consumed; read out once.
-        drop(unsafe { core::ptr::read(&raw const handler.context) });
+        // SAFETY: same heap allocation `run` would have consumed; the
+        // caller's dead-VM scope forgets the promise slot, the Blob drops.
+        drop(unsafe { bun_core::heap::take(ctx) });
     }
 
     unsafe fn run(
@@ -185,23 +182,21 @@ impl bun_jsc::work_task::WorkTaskContext for ReadFile {
 
     unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
         // SAFETY: sole owner; `run` completed on the pool, so no io is in
-        // flight. Store deref / byte buffers are process heap; the fd (if the
-        // open happened) is closed; the erased completion ctx is freed by the
-        // monomorphized dispose captured at creation.
-        let file = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
-        // SAFETY: each owned field is read out exactly once (ManuallyDrop).
+        // flight. The erased completion ctx is freed by the monomorphized
+        // dispose captured at creation; the box drops in the caller's scope.
         unsafe {
+            let file = &mut *this;
             (file.on_complete_dispose)(file.on_complete_ctx);
-            drop(core::ptr::read(&raw const file.byte_store));
-            drop(core::ptr::read(&raw const file.buffer));
-            drop(core::ptr::read(&raw const file.store));
-            let _ = core::ptr::read(&raw const file.system_error);
             // Mirror `do_close`: only path-opened fds are ours to close —
             // fd-backed blobs (`Bun.file(fd)`, stdio) borrow the caller's.
-            let fd = core::ptr::read(&raw const file.opened_fd);
-            if file.is_allowed_to_close() && fd != Fd::INVALID && fd.stdio_tag().is_none() {
-                let _ = fd.close();
+            if file.is_allowed_to_close()
+                && file.opened_fd != Fd::INVALID
+                && file.opened_fd.stdio_tag().is_none()
+            {
+                let _ = file.opened_fd.close();
+                file.opened_fd = Fd::INVALID;
             }
+            drop(bun_core::heap::take(this));
         }
     }
     fn run(this: *mut Self, task: *mut bun_jsc::work_task::WorkTask<Self>) {

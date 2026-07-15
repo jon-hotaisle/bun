@@ -615,15 +615,11 @@ impl<Op: PasswordOp> PasswordJob<Op> {
             ConcurrentTask::create_from(unsafe { core::ptr::addr_of_mut!((*result).task) })
         });
         if !queued {
-            // Owning worker VM destroyed: free the result here. The promise's
-            // handle slot died with the VM's HandleSet — forget it; `value`
-            // (owned hash bytes / error) drops normally. KeepAlive has no
-            // Drop and the dead loop must not be unref'd.
+            // Owning worker VM destroyed: free the result here (the dead-VM
+            // scope forgets the promise slot; owned bytes drop normally).
             // SAFETY: `result` was just allocated above and never shared (the
             // enqueue failed), so this thread is the sole owner.
-            let mut boxed = unsafe { bun_core::heap::take(result) };
-            let _ = core::mem::ManuallyDrop::new(core::mem::take(&mut boxed.promise));
-            drop(boxed);
+            unsafe { bun_jsc::vm_handle::dispose_box_for_dead_vm(result) };
         }
         // `self: Box<Self>` drops here; Drop runs secure_zero on password (+op).
     }
@@ -643,11 +639,8 @@ impl<Op: PasswordOp> PasswordResult<Op> {
     /// # Safety
     /// `p` is the queue-owned heap result; the owning worker VM is torn down.
     unsafe fn dispose_after_vm_destroyed(p: *mut Self) {
-        // SAFETY: sole owner. The promise slot died with the VM's HandleSet;
-        // `value` (owned hash bytes / error) drops normally.
-        let mut boxed = unsafe { bun_core::heap::take(p) };
-        let _ = core::mem::ManuallyDrop::new(core::mem::take(&mut boxed.promise));
-        drop(boxed);
+        // SAFETY: sole owner; the scope forgets the promise slot.
+        unsafe { bun_jsc::vm_handle::dispose_box_for_dead_vm(p) };
     }
 
     fn run_from_js_erased(p: *mut Self) -> AnyTaskJsResult<()> {

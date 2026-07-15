@@ -1366,16 +1366,14 @@ impl jsc::work_task::WorkTaskContext for GetAddrInfoRequest {
         bun_event_loop::ConcurrentTask::task_tag::GetAddrInfoRequestTask;
 
     unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        // SAFETY: sole owner. `backend` (owned heap) is read out and dropped;
-        // each pending `DNSLookup` box is freed with its Drop bypassed (its
-        // unref/deref targets and promise slots all died with the VM).
-        let req = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
-        // SAFETY: backend/chain nodes are read out exactly once (ManuallyDrop).
+        // SAFETY: sole owner; the chained `DNSLookup` boxes are freed too
+        // (their Drop no-ops inside the caller's dead-VM scope; the request
+        // embeds only the head node).
         unsafe {
-            drop(core::ptr::read(&raw const req.backend));
-            let mut next = req.head.next;
+            let mut next = (*this).head.next;
+            drop(bun_core::heap::take(this));
             while let Some(node) = next {
-                let node = core::mem::ManuallyDrop::new(*bun_core::heap::take(node.as_ptr()));
+                let node = bun_core::heap::take(node.as_ptr());
                 next = node.next;
             }
         }
@@ -2179,6 +2177,11 @@ impl DNSLookup {
 impl Drop for DNSLookup {
     fn drop(&mut self) {
         bun_output::scoped_log!(DNSLookup, "deinit");
+        // The loop and resolver died with the VM inside a dead-VM disposal
+        // scope (the resolver lives in the VM's GlobalData).
+        if bun_core::dead_vm_scope::in_dead_vm_disposal() {
+            return;
+        }
         let _ = self.global_this();
         // DNSLookup is always created on the JS event loop (it holds a JSGlobalObject),
         // so the Js-arm vtable is the correct EventLoopCtx for KeepAlive::unref.

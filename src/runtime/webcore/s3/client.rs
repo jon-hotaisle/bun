@@ -1234,21 +1234,20 @@ pub fn readable_stream(
         /// Dead-VM path only: caller owns `ptr` exclusively and the owning VM
         /// (and thus `readable_stream_ref`'s slot storage) is gone.
         unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
-            // `Drop` must not run: `clear_stream_cancel_handler` touches the
-            // dead stream. `readable_stream_ref` died with the VM's HandleSet;
-            // `global`/`task` are non-owning; only `path` is owned heap.
-            let this =
-                // SAFETY: same heap ctx `run`/the callback would have consumed; sole owner.
-                core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(ptr.cast::<Self>()) });
-            // SAFETY: fields are read out of the suppressed value exactly once.
-            drop(unsafe { core::ptr::read(&raw const this.path) });
+            // SAFETY: same heap ctx the callback would have consumed; sole
+            // owner (the caller's scope skips the dead-stream teardown and
+            // forgets the handle slots; `path` drops).
+            drop(unsafe { bun_core::heap::take(ptr.cast::<Self>()) });
         }
     }
 
     impl Drop for S3DownloadStreamWrapper {
         /// readable_stream_ref / path are freed by their own field Drop.
         fn drop(&mut self) {
-            self.clear_stream_cancel_handler();
+            // The stream died with the VM inside a dead-VM disposal scope.
+            if !bun_core::dead_vm_scope::in_dead_vm_disposal() {
+                self.clear_stream_cancel_handler();
+            }
         }
     }
 

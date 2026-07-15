@@ -375,7 +375,9 @@ impl S3Ext for S3 {
             /// Dead-VM path only: caller owns `ptr` exclusively and the owning
             /// VM (and `promise`'s slot storage) is gone.
             unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
-                crate::s3_dispose_promise_store_ctx!(Wrapper, ptr);
+                // SAFETY: same heap ctx the callback would have consumed;
+                // sole owner (the scope forgets the promise slot).
+                drop(unsafe { bun_core::heap::take(ptr.cast::<Wrapper>()) });
             }
         }
 
@@ -478,16 +480,9 @@ impl S3Ext for S3 {
             /// Dead-VM path only: caller owns `ptr` exclusively and the owning
             /// VM (and `promise`'s slot storage) is gone.
             unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
-                // Also frees the owned list options (process heap).
-                // SAFETY: same heap ctx the callback would have consumed; sole owner.
-                let this = core::mem::ManuallyDrop::new(*unsafe {
-                    bun_core::heap::take(ptr.cast::<Wrapper>())
-                });
-                // SAFETY: each field is read out exactly once.
-                unsafe {
-                    drop(core::ptr::read(&raw const this.store));
-                    drop(core::ptr::read(&raw const this.resolved_list_options));
-                }
+                // SAFETY: same heap ctx the callback would have consumed;
+                // sole owner (the scope forgets the promise slot).
+                drop(unsafe { bun_core::heap::take(ptr.cast::<Wrapper>()) });
             }
         }
 

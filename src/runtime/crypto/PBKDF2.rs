@@ -276,17 +276,6 @@ pub(crate) struct Pbkdf2Ctx {
 }
 
 impl AnyTaskJobCtx for Pbkdf2Ctx {
-    unsafe fn dispose_for_dead_vm(self) {
-        // SAFETY: sole owner. Skip the password/salt unprotect (dead heap);
-        // their owned bytes and `output` drop; the promise slot is forgotten.
-        let ctx = core::mem::ManuallyDrop::new(self);
-        // SAFETY: fields are read out of the suppressed value exactly once.
-        unsafe {
-            drop(core::ptr::read(&raw const ctx.pbkdf2).into_inner_for_dead_vm());
-            drop(core::ptr::read(&raw const ctx.output));
-        }
-    }
-
     fn run(&mut self, _global: *mut JSGlobalObject) {
         let len = usize::try_from(self.pbkdf2.length).expect("int cast");
         // `Vec` allocation aborts on OOM; use try_reserve to surface an error instead.

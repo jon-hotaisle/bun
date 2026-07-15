@@ -265,18 +265,12 @@ mod _impl {
             // the VM and must be forgotten, not released.
             unsafe {
                 (*this).stream.with_mut(|s| s.close());
-                let boxed = bun_core::heap::take(this);
                 // Gate closed ⇒ the owning VM is being (or has been) torn
-                // down — the handle slots die with its heap and must be
-                // forgotten, not released (this can run on a pool thread or
-                // on the worker thread mid-teardown).
-                if boxed.vm.with(|_| ()).is_none() {
-                    let _ =
-                        core::mem::ManuallyDrop::new(boxed.this_value.replace(Default::default()));
-                    let _ =
-                        core::mem::ManuallyDrop::new(boxed.poll_ref.replace(Default::default()));
-                }
-                drop(boxed);
+                // down: drop inside the dead-VM scope so the handle slots and
+                // loop ref are forgotten, not released.
+                let _scope = ((*this).vm.with(|_| ()).is_none())
+                    .then(bun_core::dead_vm_scope::DeadVmDisposalScope::enter);
+                drop(bun_core::heap::take(this));
             }
         }
     }

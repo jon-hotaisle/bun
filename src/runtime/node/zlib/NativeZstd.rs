@@ -283,16 +283,11 @@ mod _impl {
         fn destroy_on_zero(this: *mut Self) {
             // SAFETY: refcount hit zero ⇒ sole owner; Box from `constructor`.
             unsafe {
-                let boxed = bun_core::heap::take(this);
-                // Gate closed ⇒ owning VM torn down: forget the dead handle
-                // slots instead of releasing them (see NativeZlib::deinit).
-                if boxed.vm.with(|_| ()).is_none() {
-                    let _ =
-                        core::mem::ManuallyDrop::new(boxed.this_value.replace(Default::default()));
-                    let _ =
-                        core::mem::ManuallyDrop::new(boxed.poll_ref.replace(Default::default()));
-                }
-                drop(boxed);
+                // Gate closed ⇒ owning VM torn down: drop inside the dead-VM
+                // scope (see NativeZlib::deinit).
+                let _scope = ((*this).vm.with(|_| ()).is_none())
+                    .then(bun_core::dead_vm_scope::DeadVmDisposalScope::enter);
+                drop(bun_core::heap::take(this));
             }
         }
     }

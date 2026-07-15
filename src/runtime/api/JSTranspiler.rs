@@ -682,22 +682,10 @@ pub(crate) type AsyncTransformTask<'a> =
 impl<'a> jsc::concurrent_promise_task::ConcurrentPromiseTaskContext for TransformTask<'a> {
     const TASK_TAG: bun_event_loop::TaskTag = bun_event_loop::task_tag::AsyncTransformTask;
 
-    unsafe fn dispose_for_dead_vm(self) {
-        // SAFETY: sole owner. Skip the input's unprotect (dead heap) but drop
-        // its owned bytes; release the WTF ref on the output; deref the
-        // js_instance (atomic refcount; its Drop is JSC-free). `transpiler`
-        // is a ManuallyDrop bitwise copy — never dropped by design.
-        let task = core::mem::ManuallyDrop::new(self);
-        // SAFETY: each owned field is read out exactly once (ManuallyDrop).
-        unsafe {
-            drop(core::ptr::read(&raw const task.input_code).into_inner_for_dead_vm());
-            core::ptr::read(&raw const task.output_code).deref();
-            core::ptr::read(&raw const task.js_instance).deref();
-            drop(core::ptr::read(&raw const task.log));
-            let _ = core::ptr::read(&raw const task.err);
-            drop(core::ptr::read(&raw const task.macro_map));
-            drop(core::ptr::read(&raw const task.replace_exports));
-        }
+    fn dispose_extras_for_dead_vm(&mut self) {
+        // `BunString` has no drop glue: release the WTF ref on the output.
+        // (`js_instance` is released by `Drop for TransformTask`.)
+        core::mem::take(&mut self.output_code).deref();
     }
     fn run(&mut self) {
         TransformTask::run(self)

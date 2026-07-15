@@ -108,24 +108,6 @@ pub enum S3PartResult<'a> {
     Failure(S3Error<'a>),
 }
 
-/// Dead-VM dispose for the common S3 callback ctx shape `{ promise, store, .. }`:
-/// forget the promise slot (died with the VM's HandleSet), deref the
-/// thread-safe `StoreRef`, forget the rest.
-#[macro_export]
-macro_rules! s3_dispose_promise_store_ctx {
-    ($ty:ty, $ptr:expr) => {{
-        let ptr: *mut ::core::ffi::c_void = $ptr;
-        // SAFETY: same heap ctx the callback would have consumed; sole owner.
-        #[allow(unused_unsafe)]
-        let this =
-            ::core::mem::ManuallyDrop::new(*unsafe { ::bun_core::heap::take(ptr.cast::<$ty>()) });
-        // SAFETY: `store` is read out exactly once.
-        #[allow(unused_unsafe)]
-        // SAFETY: single read of the suppressed value.
-        drop(unsafe { ::core::ptr::read(&raw const this.store) });
-    }};
-}
-
 pub struct S3HttpSimpleTask {
     // `http` is `MaybeUninit` because (a) it is initialised late —
     // `AsyncHTTP` contains `&'static [u8]` and `fn(...)` fields, so a
@@ -518,28 +500,12 @@ impl S3HttpSimpleTask {
 // thread when `enqueue_intrusive` finds the owning worker VM destroyed.
 unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for S3HttpSimpleTask {
     unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        // SAFETY: caller owns `this` exclusively; `ManuallyDrop` suppresses
-        // `Drop` (its `poll_ref.unref` would touch the dead VM's loop).
-        let mut task = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
-        // SAFETY: fields are read out of the suppressed value exactly once.
+        let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
+        // SAFETY: caller owns `this` exclusively; `Drop` handles the http
+        // cleanup (its loop unref no-ops inside the scope).
         unsafe {
-            (task.callback_context_dispose)(task.callback_context);
-            // Mirror `Drop`'s http cleanup (transfer is done, so the HTTP
-            // thread no longer aliases these buffers).
-            let http = task.http.assume_init_mut();
-            http.clear_data();
-            http.request_headers = Default::default();
-            http.client.header_entries = Default::default();
-            // Owned process-heap fields; `poll_ref` (no Drop) and the fn
-            // pointers are forgotten with the rest.
-            drop(core::ptr::read(&raw const task.result));
-            drop(core::ptr::read(&raw const task.sign_result));
-            drop(core::ptr::read(&raw const task.headers));
-            drop(core::ptr::read(&raw const task.response_buffer));
-            drop(core::ptr::read(&raw const task.range));
-            drop(core::ptr::read(&raw const task.proxy_url));
-            drop(core::ptr::read(&raw const task.body));
-            drop(core::ptr::read(&raw const task.vm));
+            ((*this).callback_context_dispose)((*this).callback_context);
+            drop(bun_core::heap::take(this));
         }
     }
 }

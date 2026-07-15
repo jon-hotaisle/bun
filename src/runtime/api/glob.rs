@@ -237,10 +237,6 @@ impl<'a> WalkTask<'a> {
 impl<'a> ConcurrentPromiseTaskContext for WalkTask<'a> {
     const TASK_TAG: bun_event_loop::TaskTag = bun_event_loop::task_tag::AsyncGlobWalkTask;
 
-    unsafe fn dispose_for_dead_vm(self) {
-        // Plain drop: walker/err own only fs state; `has_pending_activity`
-        // points into the dead JS wrapper and has no drop glue.
-    }
     fn run(&mut self) {
         let guard = scopeguard::guard(self.has_pending_activity, |hpa| {
             decr_pending_activity_flag(hpa);

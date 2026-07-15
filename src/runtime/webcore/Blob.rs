@@ -4695,7 +4695,9 @@ fn write_file_with_empty_source_to_destination(
                 /// Dead-VM path only: caller owns `ptr` exclusively and the
                 /// owning VM (and `promise`'s slot storage) is gone.
                 unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
-                    crate::s3_dispose_promise_store_ctx!(Wrapper, ptr);
+                    // SAFETY: same heap ctx the callback would have consumed;
+                    // sole owner (the scope forgets the promise slot).
+                    drop(unsafe { bun_core::heap::take(ptr.cast::<Wrapper>()) });
                 }
             }
 
@@ -4988,7 +4990,9 @@ pub fn write_file_with_source_destination(
                         /// Dead-VM path only: caller owns `ptr` exclusively and
                         /// the owning VM (and `promise`'s slot storage) is gone.
                         unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
-                            crate::s3_dispose_promise_store_ctx!(Wrapper, ptr);
+                            // SAFETY: same heap ctx the callback would have
+                            // consumed; sole owner (scope forgets the slot).
+                            drop(unsafe { bun_core::heap::take(ptr.cast::<Wrapper>()) });
                         }
                     }
                     let promise = jsc::JSPromiseStrong::init(ctx);
@@ -5933,15 +5937,9 @@ impl S3BlobDownloadTask {
     /// Dead-VM path only: caller owns `ptr` exclusively and the owning VM
     /// (and `promise`'s slot storage) is gone.
     unsafe fn dispose_for_dead_vm(ptr: *mut c_void) {
-        // `ManuallyDrop` skips `Drop` (`poll_ref.unref` would touch the dead
-        // VM's loop) and forgets `promise`; the blob's `StoreRef` deref is
-        // thread-safe; `global_this`/`handler` are non-owning.
-        // SAFETY: same heap ctx `run`/the callback would have consumed; sole owner.
-        let this = core::mem::ManuallyDrop::new(*unsafe {
-            bun_core::heap::take(ptr.cast::<S3BlobDownloadTask>())
-        });
-        // SAFETY: fields are read out of the suppressed value exactly once.
-        drop(unsafe { core::ptr::read(&raw const this.blob) });
+        // SAFETY: same heap ctx the callback would have consumed; sole owner
+        // (the caller's dead-VM scope forgets the promise slot and loop ref).
+        drop(unsafe { bun_core::heap::take(ptr.cast::<S3BlobDownloadTask>()) });
     }
 
     pub fn init(

@@ -91,29 +91,26 @@ impl JSBundleCompletionTask {
         let mut boxed = unsafe { bun_core::heap::take(this) };
         boxed.poll_ref.disable();
         if let Some(plugin) = boxed.plugins.take() {
-            // `plugin` is the live FFI handle stashed at construction;
-            // last-ref drop is the only place that releases it.
-            Plugin::destroy(plugin.as_ptr());
+            // The plugin cell died with the VM inside a dead-VM disposal
+            // scope; otherwise this last-ref drop releases the FFI handle.
+            if !bun_core::dead_vm_scope::in_dead_vm_disposal() {
+                Plugin::destroy(plugin.as_ptr());
+            }
         }
         // Owned fields (`config`, `log`, `result`, `promise`) drop with the Box.
     }
 }
 
-// SAFETY: frees `this` exactly once per the trait contract.
+// SAFETY: releases the caller's ref inside the dead-VM scope; frees only
+// when no other holder (e.g. an HTMLBundle route in the dead heap) remains.
 unsafe impl bun_jsc::vm_handle::DisposeAfterVmDestroyed for JSBundleCompletionTask {
     unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        // The JS-thread-affine refcount is bypassed (its keepalive ref can
-        // never be released) and the box force-freed; promise slot and plugin
-        // cell died with the VM, owned buffers are read out and dropped.
-        // SAFETY: sole owner per the trait contract.
-        let task = core::mem::ManuallyDrop::new(*unsafe { bun_core::heap::take(this) });
-        // SAFETY: each owned field is read out exactly once (ManuallyDrop).
-        unsafe {
-            drop(core::ptr::read(&raw const task.config));
-            drop(core::ptr::read(&raw const task.log));
-            drop(core::ptr::read(&raw const task.result));
-            drop(core::ptr::read(&raw const task.vm));
-        }
+        let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
+        // SAFETY: the JS thread is gone, so this thread is the sole toucher
+        // of the JS-thread-affine refcount. A route-held completion stays
+        // allocated (bounded — it dies with the route's request lifecycle,
+        // which the terminated VM has already abandoned).
+        unsafe { <Self as bun_ptr::AnyRefCounted>::rc_deref(this) };
     }
 }
 
@@ -1029,12 +1026,14 @@ impl CompletionStruct for JSBundleCompletionTask {
 
     fn pin_vm_for_bundle(&self) -> bun_bundler::BundleThread::BundlePin {
         use bun_bundler::BundleThread::BundlePin;
-        if self.plugins.is_some() {
-            // See `BundlePin::Unpinned` — plugin builds round-trip through
-            // the owning JS thread mid-bundle.
-            return BundlePin::Unpinned;
-        }
         match self.vm.pin_for_bounded_work() {
+            // See `BundlePin::Unpinned` — plugin builds round-trip through
+            // the owning JS thread mid-bundle, so holding the pin would
+            // deadlock worker terminate.
+            Some(guard) if self.plugins.is_some() => {
+                drop(guard);
+                BundlePin::Unpinned
+            }
             Some(guard) => BundlePin::Pinned(guard),
             None => BundlePin::VmGone,
         }

@@ -30,13 +30,16 @@ pub trait WorkTaskContext: Sized {
     fn run(this: *mut Self, task: *mut WorkTask<Self>);
     fn then(this: *mut Self, global_this: &JSGlobalObject) -> Result<(), crate::JsTerminated>;
 
-    /// Free the context after its owning VM was destroyed (see
-    /// [`crate::vm_handle::DisposeAfterVmDestroyed`]): forget JSC handle
-    /// fields, free everything else.
+    /// Free the heap context after its owning VM was destroyed. Runs inside
+    /// the dead-VM disposal scope (handle slots and pins are forgotten);
+    /// override only to release non-Drop resources first. Default: drop.
     ///
     /// # Safety
     /// `this` is live and exclusively owned; the owning VM is gone.
-    unsafe fn dispose_after_vm_destroyed(this: *mut Self);
+    unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
+        // SAFETY: forwarded caller contract — sole owner of a heap ctx.
+        drop(unsafe { bun_core::heap::take(this) });
+    }
 }
 
 pub struct WorkTask<Context: WorkTaskContext> {
@@ -65,14 +68,14 @@ impl<Context: WorkTaskContext> Taskable for WorkTask<Context> {
     const TAG: TaskTag = Context::TASK_TAG;
 }
 
-// SAFETY: frees `this` exactly once per the trait contract.
+// SAFETY: shell fields have no entangled drop glue; the heap ctx is freed
+// via its own dispose, all inside the dead-VM scope.
 unsafe impl<Context: WorkTaskContext> crate::vm_handle::DisposeAfterVmDestroyed
     for WorkTask<Context>
 {
     unsafe fn dispose_after_vm_destroyed(this: *mut Self) {
-        // SAFETY: caller owns `this` exclusively. No field of the shell has
-        // entangled drop glue (`vm` is an Arc, `ref_`/`global_this` are plain),
-        // so a normal move-out suffices; only the context needs special care.
+        let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
+        // SAFETY: sole owner per the trait contract.
         let task = *unsafe { bun_core::heap::take(this) };
         // SAFETY: `ctx` is the live context passed to `create_on_js_thread`.
         unsafe { Context::dispose_after_vm_destroyed(task.ctx) };

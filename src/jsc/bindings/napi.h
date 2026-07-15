@@ -7,6 +7,7 @@
 
 #include "headers-handwritten.h"
 #include "BunClientData.h"
+#include <wtf/ThreadSafeRefCounted.h>
 #include <JavaScriptCore/CallFrame.h>
 #include "node_api.h"
 #include <JavaScriptCore/JSWeakValue.h>
@@ -173,7 +174,9 @@ static bool equal(napi_async_cleanup_hook_handle one, napi_async_cleanup_hook_ha
     } while (0)
 
 // Named this way so we can manipulate napi_env values directly (since napi_env is defined as a pointer to struct napi_env__)
-struct NapiEnv : public WTF::RefCounted<NapiEnv> {
+// ThreadSafeRefCounted: a work-pool dead-VM dispose can release its ref
+// concurrently with the worker thread's own env derefs during teardown.
+struct NapiEnv : public WTF::ThreadSafeRefCounted<NapiEnv> {
     WTF_MAKE_STRUCT_TZONE_ALLOCATED(NapiEnv);
 
 public:

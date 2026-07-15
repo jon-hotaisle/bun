@@ -24,14 +24,6 @@ pub(crate) struct SecretsCtx {
 }
 
 impl AnyTaskJobCtx for SecretsCtx {
-    unsafe fn dispose_for_dead_vm(self) {
-        // SAFETY: sole owner. The C++ options are plain non-JSC state
-        // (`delete opts`); the promise slot died with the VM's HandleSet.
-        let ctx = core::mem::ManuallyDrop::new(self);
-        // SAFETY: `ctx.ctx` is the live C++ options passed to `create`.
-        unsafe { Bun__SecretsJobOptions__deinit(ctx.ctx) };
-    }
-
     fn run(&mut self, global: *mut JSGlobalObject) {
         // `ctx` is a valid C++ SecretsJobOptions* held alive until Drop;
         // `global` is the creating VM's global pointer. Both are `opaque_ffi!`

@@ -136,5 +136,28 @@ pub unsafe trait DisposeAfterVmDestroyed {
     /// # Safety
     /// `this` is live, exclusively owned by the caller, and its owning VM has
     /// been destroyed (its gate is closed).
-    unsafe fn dispose_after_vm_destroyed(this: *mut Self);
+    unsafe fn dispose_after_vm_destroyed(this: *mut Self)
+    where
+        Self: Sized,
+    {
+        // SAFETY: forwarded caller contract.
+        unsafe { dispose_box_for_dead_vm(this) };
+    }
+}
+
+/// Free a heap object inside a [dead-VM disposal
+/// scope](bun_core::dead_vm_scope): JSC handle wrappers, protect pins, loop
+/// refs and env refs no-op their release (their storage died with the VM),
+/// while every other field drops normally. Types owning resources with no
+/// drop glue (raw fds, `Buffer`, `BunString`, C contexts) must override
+/// [`DisposeAfterVmDestroyed::dispose_after_vm_destroyed`] and release those
+/// explicitly before (or instead of) calling this.
+///
+/// # Safety
+/// `this` is a live `heap::alloc`/`Box` allocation exclusively owned by the
+/// caller; its owning VM has been destroyed (or is past teardown).
+pub unsafe fn dispose_box_for_dead_vm<T>(this: *mut T) {
+    let _scope = bun_core::dead_vm_scope::DeadVmDisposalScope::enter();
+    // SAFETY: caller contract.
+    drop(unsafe { bun_core::heap::take(this) });
 }

@@ -585,7 +585,9 @@ impl S3BlobStatTask {
     /// Dead-VM path only: caller owns `ptr` exclusively and the owning VM
     /// (and thus `promise`/`global`'s slot storage) is gone.
     unsafe fn dispose_for_dead_vm(ptr: *mut core::ffi::c_void) {
-        crate::s3_dispose_promise_store_ctx!(Self, ptr);
+        // SAFETY: same heap ctx the callback would have consumed; sole owner
+        // (the caller's dead-VM scope forgets the promise slot; store drops).
+        drop(unsafe { bun_core::heap::take(ptr.cast::<Self>()) });
     }
 
     pub(crate) fn exists(global: &JSGlobalObject, blob: &Blob) -> JsResult<JSValue> {

@@ -85,6 +85,10 @@ impl KeepAlive {
             return;
         }
         self.status = Status::Inactive;
+        // The loop died with the VM inside a dead-VM disposal scope.
+        if bun_core::dead_vm_scope::in_dead_vm_disposal() {
+            return;
+        }
         #[cfg(not(windows))]
         event_loop_ctx.loop_unref();
         #[cfg(windows)]
